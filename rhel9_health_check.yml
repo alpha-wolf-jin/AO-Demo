@@ -1,0 +1,54 @@
+---
+- name: RHEL 9 System Health Check
+  hosts: all
+  become: yes
+  gather_facts: yes
+
+  tasks:
+    - name: Check system uptime
+      ansible.builtin.command: uptime -p
+      register: uptime_result
+
+    - name: Check disk space usage
+      ansible.builtin.command: df -hT -x tmpfs -x devtmpfs
+      register: disk_result
+
+    - name: Check memory usage
+      ansible.builtin.command: free -h
+      register: mem_result
+
+    - name: Check for failed systemd services
+      ansible.builtin.command: systemctl list-units --state=failed --no-pager
+      register: failed_services_result
+      failed_when: false
+
+    - name: Check CPU load averages
+      ansible.builtin.command: cat /proc/loadavg
+      register: load_result
+
+    - name: Generate health check report locally
+      ansible.builtin.copy:
+        dest: "/tmp/health_check_{{ inventory_hostname }}_{{ ansible_date_time.date }}.txt"
+        content: |
+          =============================================
+          HEALTH CHECK REPORT FOR: {{ inventory_hostname }}
+          OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          Date: {{ ansible_date_time.iso8601 }}
+          =============================================
+          
+          --- UPTIME ---
+          {{ uptime_result.stdout }}
+          
+          --- LOAD AVERAGE ---
+          {{ load_result.stdout }}
+          
+          --- MEMORY USAGE ---
+          {{ mem_result.stdout }}
+          
+          --- DISK SPACE ---
+          {{ disk_result.stdout }}
+          
+          --- FAILED SERVICES ---
+          {{ failed_services_result.stdout }}
+      delegate_to: localhost
+      become: no
