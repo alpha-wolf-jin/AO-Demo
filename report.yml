@@ -4,4 +4,4 @@
   tasks:
     - name: Notify user via Email
       ansible.builtin.debug: 
-        msg: "{{ report }}"
+        msg: "{{ report | split('\n') | list }}"
