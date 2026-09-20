@@ -49,3 +49,11 @@
           - ''
           - --- FAILED SERVICES ---
           - "{{ failed_services_result.stdout }}"
+
+    - name: Publish health metrics to Automation Orchestrator
+      ansible.builtin.set_stats:
+        data:
+          cpu_usage: "{{ load_result.stdout }}"
+          memory_usage: "{{ mem_result.stdout }}"
+          disk_space: "{{ disk_result.stdout }}"
+
