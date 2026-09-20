@@ -30,22 +30,22 @@
       ansible.builtin.debug:
         msg: 
           - =============================================
-          - HEALTH CHECK REPORT FOR: {{ inventory_hostname }}
-          - OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
-          - Date: {{ ansible_date_time.iso8601 }}
+          - "HEALTH CHECK REPORT FOR: {{ inventory_hostname }}"
+          - "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Date: {{ ansible_date_time.iso8601 }}"
           - =============================================
           - '' 
           - --- UPTIME ---
-          - {{ uptime_result.stdout }}
+          - "{{ uptime_result.stdout }}"
           - ''
           - --- LOAD AVERAGE ---
-          - {{ load_result.stdout }}
+          - "{{ load_result.stdout }}"
           - ''
           - --- MEMORY USAGE ---
-          - {{ mem_result.stdout }}
+          - "{{ mem_result.stdout }}"
           - ''
           - --- DISK SPACE ---
-          - {{ disk_result.stdout }}
+          - "{{ disk_result.stdout }}"
           - ''
           - --- FAILED SERVICES ---
-          - {{ failed_services_result.stdout }}
+          - "{{ failed_services_result.stdout }}"
