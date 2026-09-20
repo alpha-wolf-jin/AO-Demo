@@ -27,9 +27,8 @@
       register: load_result
 
     - name: Generate health check report locally
-      ansible.builtin.copy:
-        dest: "/tmp/health_check_{{ inventory_hostname }}_{{ ansible_date_time.date }}.txt"
-        content: |
+      ansible.builtin.debug:
+        msg: |
           =============================================
           HEALTH CHECK REPORT FOR: {{ inventory_hostname }}
           OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
@@ -50,5 +49,3 @@
           
           --- FAILED SERVICES ---
           {{ failed_services_result.stdout }}
-      delegate_to: localhost
-      become: no
