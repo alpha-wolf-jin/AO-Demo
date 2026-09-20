@@ -1,0 +1,7 @@
+- name: Send Health Summary Notification
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Notify user via Email
+      ansible.builtin.debug: 
+        msg: "{{ report }}"
