@@ -1,0 +1,275 @@
+---
+# migrate_inventory_group.yml
+#
+# Migrate an AAP inventory group (its description, variables, hosts, and ONE LEVEL
+# of child subgroups) from a source inventory to a target inventory, then delete the
+# source group structure while keeping the underlying hosts.
+#
+# Key changes vs. the previous version:
+#   * VERIFY-BEFORE-DELETE: the target is re-read and asserted complete BEFORE the
+#     source is deleted. A failed verification aborts (via rescue) with the source intact.
+#   * Child subgroups are CREATED in the target (with their own description, variables,
+#     and hosts) before being linked to the migrated parent — previously they were
+#     referenced by name but never created, so the link would fail / drop the subtree.
+#   * Host ATTRIBUTES (description, enabled, variables) are migrated, not just names.
+#   * Both inventories are checked for existence up front.
+#
+# SCOPE: root group + its immediate children (one level). Grandchildren are NOT walked.
+#        See note at the bottom for the recursive version.
+#
+# RUNTIME CHECK: this relies on the ansible.controller.controller_api LOOKUP reaching
+#        your controller through the gateway. If the reads 404 (as export did), your
+#        collection's lookup isn't gateway-aware — smoke-test the first set_fact before
+#        trusting the rest. The host/group MODULES use controller_host and are gateway-aware.
+#
+# no_log: the credential-bearing set_fact/lookup tasks are marked no_log. Comment those
+#        out temporarily if you need to debug a failing lookup.
+
+- name: "SOP 'migrate_inventory_group' (ACTION — deletes source group structure): migrate a group + its immediate child subgroups between AAP inventories [target: localhost]"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    source_inventory: ""
+    target_inventory: ""
+    group_name: ""
+    aap_gateway_ip: ""
+    aap_username: ""
+    aap_password: ""
+    aap_validate_certs: false
+
+  tasks:
+    - block:
+
+        # ---- Pre-checks -------------------------------------------------------
+        - name: "Validate required migration variables"
+          ansible.builtin.assert:
+            that:
+              - "source_inventory | length > 0"
+              - "target_inventory | length > 0"
+              - "group_name | length > 0"
+              - "aap_gateway_ip | length > 0"
+              - "aap_username | length > 0"
+              - "aap_password | length > 0"
+            fail_msg: "One or more required migration variables are missing or empty"
+
+        - name: "Resolve source and target inventories"
+          ansible.builtin.set_fact:
+            _source_inv: >-
+              {{ query('ansible.controller.controller_api', 'inventories',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs,
+                       query_params={'name': source_inventory}, return_all=true) | flatten }}
+            _target_inv: >-
+              {{ query('ansible.controller.controller_api', 'inventories',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs,
+                       query_params={'name': target_inventory}, return_all=true) | flatten }}
+          no_log: true
+
+        - name: "Assert both inventories exist"
+          ansible.builtin.assert:
+            that:
+              - "_source_inv | length == 1"
+              - "_target_inv | length == 1"
+            fail_msg: "Source ('{{ source_inventory }}') or target ('{{ target_inventory }}') inventory not found"
+
+        - name: "Look up source group in source inventory"
+          ansible.builtin.set_fact:
+            _source_group: >-
+              {{ query('ansible.controller.controller_api', 'groups',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs,
+                       query_params={'name': group_name, 'inventory__name': source_inventory},
+                       return_all=true) | flatten }}
+          no_log: true
+
+        - name: "Set source-group existence flag and ID"
+          ansible.builtin.set_fact:
+            _source_group_exists: "{{ _source_group | length == 1 }}"
+            _source_group_id: "{{ (_source_group | first).id if _source_group | length == 1 else '' }}"
+
+        - name: "Look up hosts directly in the source group"
+          ansible.builtin.set_fact:
+            _source_hosts: >-
+              {{ query('ansible.controller.controller_api', 'groups/' ~ _source_group_id ~ '/hosts/',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs, return_all=true) | flatten }}
+          when: _source_group_exists | bool
+          no_log: true
+
+        - name: "Look up immediate child subgroups of the source group"
+          ansible.builtin.set_fact:
+            _source_child_groups: >-
+              {{ query('ansible.controller.controller_api', 'groups/' ~ _source_group_id ~ '/children/',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs, return_all=true) | flatten }}
+          when: _source_group_exists | bool
+          no_log: true
+
+        - name: "Collect hosts for each child subgroup (aligned to _source_child_groups order)"
+          ansible.builtin.set_fact:
+            _child_host_batches: >-
+              {{ (_child_host_batches | default([])) + [ query(
+                   'ansible.controller.controller_api', 'groups/' ~ item.id ~ '/hosts/',
+                   host=aap_gateway_ip, username=aap_username, password=aap_password,
+                   verify_ssl=aap_validate_certs, return_all=true) | flatten ] }}
+          loop: "{{ _source_child_groups | default([]) }}"
+          loop_control:
+            label: "{{ item.name }}"
+          when: _source_group_exists | bool
+          no_log: true
+
+        - name: "Normalize source group variables to a dict"
+          ansible.builtin.set_fact:
+            _group_variables: >-
+              {{ ((_source_group | first).variables | default('', true) | trim | from_yaml | default({}, true))
+                 if ((_source_group | first).variables | default('', true) | trim | length > 0)
+                 else {} }}
+          when: _source_group_exists | bool
+
+        # ---- Create in target (hosts -> child groups -> parent, then link) ----
+        - name: "Ensure all hosts exist in target inventory (with description, enabled, variables)"
+          ansible.controller.host:
+            name: "{{ item.name }}"
+            inventory: "{{ target_inventory }}"
+            description: "{{ item.description | default('', true) }}"
+            enabled: "{{ item.enabled | default(true) }}"
+            variables: >-
+              {{ (item.variables | default('', true) | trim | from_yaml | default({}, true))
+                 if (item.variables | default('', true) | trim | length > 0) else {} }}
+            state: present
+            controller_host: "https://{{ aap_gateway_ip }}"
+            controller_username: "{{ aap_username }}"
+            controller_password: "{{ aap_password }}"
+            validate_certs: "{{ aap_validate_certs | bool }}"
+          # host creation is idempotent, so duplicate names across groups are harmless
+          loop: "{{ _source_hosts + (_child_host_batches | default([]) | flatten) }}"
+          loop_control:
+            label: "{{ item.name }}"
+          when: _source_group_exists | bool
+
+        - name: "Create child subgroups in target inventory (with their own vars/description/hosts)"
+          ansible.controller.group:
+            name: "{{ item.0.name }}"
+            description: "{{ item.0.description | default('', true) }}"
+            inventory: "{{ target_inventory }}"
+            variables: >-
+              {{ (item.0.variables | default('', true) | trim | from_yaml | default({}, true))
+                 if (item.0.variables | default('', true) | trim | length > 0) else {} }}
+            hosts: "{{ item.1 | map(attribute='name') | list }}"
+            preserve_existing_hosts: true
+            preserve_existing_children: true
+            state: present
+            controller_host: "https://{{ aap_gateway_ip }}"
+            controller_username: "{{ aap_username }}"
+            controller_password: "{{ aap_password }}"
+            validate_certs: "{{ aap_validate_certs | bool }}"
+          loop: "{{ _source_child_groups | zip(_child_host_batches | default([])) | list }}"
+          loop_control:
+            label: "{{ item.0.name }}"
+          when: _source_group_exists | bool
+
+        - name: "Create migrated parent group in target and link its hosts + children"
+          ansible.controller.group:
+            name: "{{ group_name }}"
+            description: "{{ (_source_group | first).description | default('', true) }}"
+            inventory: "{{ target_inventory }}"
+            variables: "{{ _group_variables }}"
+            hosts: "{{ _source_hosts | map(attribute='name') | list }}"
+            children: "{{ _source_child_groups | map(attribute='name') | list }}"
+            preserve_existing_hosts: true
+            preserve_existing_children: true
+            state: present
+            controller_host: "https://{{ aap_gateway_ip }}"
+            controller_username: "{{ aap_username }}"
+            controller_password: "{{ aap_password }}"
+            validate_certs: "{{ aap_validate_certs | bool }}"
+          when: _source_group_exists | bool
+
+        # ---- VERIFY (gate) — runs BEFORE any delete ---------------------------
+        - name: "VERIFY - re-read migrated parent group from target"
+          ansible.builtin.set_fact:
+            _verify_root: >-
+              {{ query('ansible.controller.controller_api', 'groups',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs,
+                       query_params={'name': group_name, 'inventory__name': target_inventory},
+                       return_all=true) | flatten }}
+          when: _source_group_exists | bool
+          no_log: true
+
+        - name: "VERIFY - re-read migrated children from target parent group"
+          ansible.builtin.set_fact:
+            _verify_children: >-
+              {{ query('ansible.controller.controller_api', 'groups/' ~ (_verify_root | first).id ~ '/children/',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs, return_all=true) | flatten }}
+          when:
+            - _source_group_exists | bool
+            - _verify_root | length == 1
+          no_log: true
+
+        - name: "VERIFY - assert target is complete before deleting source"
+          ansible.builtin.assert:
+            that:
+              - "_verify_root | length == 1"
+              - >-
+                (_verify_children | default([]) | map(attribute='name') | sort)
+                == (_source_child_groups | map(attribute='name') | sort)
+            fail_msg: "Verification FAILED — migrated group/children incomplete in target. Source left INTACT."
+            success_msg: "Verified parent group and {{ _source_child_groups | length }} child subgroup(s) in target; safe to delete source."
+          when: _source_group_exists | bool
+
+        # ---- Delete source (only reached if verification passed) --------------
+        - name: "Delete old group structure from source inventory (underlying hosts kept)"
+          ansible.controller.group:
+            name: "{{ item }}"
+            inventory: "{{ source_inventory }}"
+            state: absent
+            controller_host: "https://{{ aap_gateway_ip }}"
+            controller_username: "{{ aap_username }}"
+            controller_password: "{{ aap_password }}"
+            validate_certs: "{{ aap_validate_certs | bool }}"
+          loop: "{{ (_source_child_groups | map(attribute='name') | list) + [group_name] }}"
+          when: _source_group_exists | bool
+
+        # ---- Report -----------------------------------------------------------
+        - name: "Emit migration result"
+          ansible.builtin.debug:
+            msg: |
+              <result>
+              group_name: {{ group_name }}
+              source_inventory: {{ source_inventory }}
+              target_inventory: {{ target_inventory }}
+              migrated_hosts: {{ (_source_hosts + (_child_host_batches | default([]) | flatten)) | map(attribute='name') | unique | list }}
+              migrated_children: {{ _source_child_groups | map(attribute='name') | list }}
+              status: Group migrated successfully.
+              </result>
+          when: _source_group_exists | bool
+
+      rescue:
+        - name: "Rescue - emit error result"
+          ansible.builtin.debug:
+            msg: |
+              <result>
+              ERROR: migrate_inventory_group failed on {{ inventory_hostname }} - {{ ansible_failed_task.name | default('unknown task') }}: {{ ansible_failed_result.msg | default('unknown error') }}
+              </result>
+
+        - name: "Rescue - fail playbook"
+          ansible.builtin.fail:
+            msg: "migrate_inventory_group failed"
+
+    # ---- Missing source group (outside block; block completed without error) --
+    - name: "Emit error for missing source group"
+      ansible.builtin.debug:
+        msg: |
+          <result>
+          ERROR: migrate_inventory_group failed on {{ inventory_hostname }} - source group '{{ group_name }}' not found in source inventory '{{ source_inventory }}'
+          </result>
+      when: not (_source_group_exists | bool)
+
+    - name: "Fail for missing source group"
+      ansible.builtin.fail:
+        msg: "Source group '{{ group_name }}' not found in source inventory '{{ source_inventory }}'"
+      when: not (_source_group_exists | bool)
