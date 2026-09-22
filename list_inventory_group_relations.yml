@@ -1,0 +1,130 @@
+---
+# list_inventory_group_relations.yml
+#
+# READ-ONLY. Given an AAP inventory, report its group structure:
+#   * If any group has child sub-groups -> emit the parent -> children relation map
+#     (plus the root groups, i.e. groups that are not a child of any other group).
+#   * If no sub-groups exist            -> emit a flat list of all groups.
+#   * If the inventory has no groups     -> report that.
+#
+# Makes no changes. Uses the ansible.controller.controller_api LOOKUP, so it needs a
+# gateway-aware collection in the EE (same runtime dependency as the migration tool).
+# Handles arbitrary nesting depth: the relation map is a direct-children adjacency
+# list, from which any depth of tree can be read.
+
+- name: "SOP 'list_inventory_group_relations' (READ-ONLY): report the group / sub-group structure of an AAP inventory [target: localhost]"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    inventory_name: ""
+    aap_gateway_ip: ""
+    aap_username: ""
+    aap_password: ""
+    aap_validate_certs: false
+
+  tasks:
+    - block:
+
+        - name: "Validate required variables"
+          ansible.builtin.assert:
+            that:
+              - "inventory_name | length > 0"
+              - "aap_gateway_ip | length > 0"
+              - "aap_username | length > 0"
+              - "aap_password | length > 0"
+            fail_msg: "One or more required variables are missing or empty"
+
+        - name: "Resolve inventory by name"
+          ansible.builtin.set_fact:
+            _inventory: >-
+              {{ query('ansible.controller.controller_api', 'inventories',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs,
+                       query_params={'name': inventory_name}, return_all=true) | flatten }}
+          no_log: true
+
+        - name: "Assert inventory exists"
+          ansible.builtin.assert:
+            that:
+              - "_inventory | length == 1"
+            fail_msg: "Inventory '{{ inventory_name }}' not found"
+
+        - name: "Set inventory ID"
+          ansible.builtin.set_fact:
+            _inventory_id: "{{ (_inventory | first).id }}"
+
+        - name: "Fetch all groups in the inventory"
+          ansible.builtin.set_fact:
+            _all_groups: >-
+              {{ query('ansible.controller.controller_api',
+                       'inventories/' ~ _inventory_id ~ '/groups/',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs, return_all=true) | flatten }}
+          no_log: true
+
+        - name: "Fetch direct children of each group (build parent -> children relations)"
+          ansible.builtin.set_fact:
+            _relations: >-
+              {{ (_relations | default([])) + [ {
+                   'parent': item.name,
+                   'children': (query('ansible.controller.controller_api',
+                                      'groups/' ~ item.id ~ '/children/',
+                                      host=aap_gateway_ip, username=aap_username, password=aap_password,
+                                      verify_ssl=aap_validate_certs, return_all=true)
+                                | flatten | map(attribute='name') | list) }
+                 ] }}
+          loop: "{{ _all_groups }}"
+          loop_control:
+            label: "{{ item.name }}"
+          no_log: true
+
+        - name: "Compute structure summary"
+          ansible.builtin.set_fact:
+            _all_group_names: "{{ _all_groups | map(attribute='name') | sort }}"
+            _child_names: "{{ _relations | default([]) | map(attribute='children') | flatten | unique | list }}"
+
+        - name: "Compute roots and sub-group flag"
+          ansible.builtin.set_fact:
+            _root_groups: "{{ _all_group_names | difference(_child_names) | sort }}"
+            _has_subgroups: "{{ _child_names | length > 0 }}"
+
+        - name: "Report - relation map (sub-groups present)"
+          ansible.builtin.debug:
+            msg: |
+              <result>
+              inventory: {{ inventory_name }}
+              group_count: {{ _all_group_names | length }}
+              has_subgroups: true
+              root_groups: {{ _root_groups }}
+              relation_map:
+              {% for rel in (_relations | selectattr('children') | list) %}
+                {{ rel.parent }}: {{ rel.children }}
+              {% endfor %}
+              status: Sub-groups found; parent -> children relation map listed.
+              </result>
+          when: _has_subgroups | bool
+
+        - name: "Report - flat group list (no sub-groups)"
+          ansible.builtin.debug:
+            msg: |
+              <result>
+              inventory: {{ inventory_name }}
+              group_count: {{ _all_group_names | length }}
+              has_subgroups: false
+              groups: {{ _all_group_names }}
+              status: {{ 'No sub-groups; all groups listed.' if (_all_group_names | length > 0) else 'Inventory has no groups.' }}
+              </result>
+          when: not (_has_subgroups | bool)
+
+      rescue:
+        - name: "Rescue - emit error result"
+          ansible.builtin.debug:
+            msg: |
+              <result>
+              ERROR: list_inventory_group_relations failed on {{ inventory_hostname }} - {{ ansible_failed_task.name | default('unknown task') }}: {{ ansible_failed_result.msg | default('unknown error') }}
+              </result>
+
+        - name: "Rescue - fail playbook"
+          ansible.builtin.fail:
+            msg: "list_inventory_group_relations failed"
