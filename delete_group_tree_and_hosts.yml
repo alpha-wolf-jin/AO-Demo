@@ -1,0 +1,249 @@
+---
+# delete_group_tree_and_hosts.yml
+#
+# Delete a group and its ENTIRE sub-group tree (any depth) from an AAP inventory,
+# and delete the hosts that belong to those groups. Deleting a group removes it and
+# its child-group associations; this play deletes every group in the sub-tree, so the
+# whole structure is removed.
+#
+# HOST SAFETY (important — a host belongs to the inventory, and deleting it removes it
+# everywhere):
+#   * By default only hosts that are EXCLUSIVE to the deleted sub-tree are deleted —
+#     i.e. hosts whose group memberships all fall inside the sub-tree.
+#   * Hosts that also belong to a group OUTSIDE the sub-tree are SKIPPED and reported,
+#     so this play never silently removes a host another group still uses.
+#   * Set force_delete_shared_hosts=true to delete those shared hosts anyway.
+#   * Set delete_hosts=false to delete only the groups and leave all hosts in place.
+#
+# dry_run=true reports exactly what WOULD be deleted (groups + hosts + skipped shared
+# hosts) and changes nothing. Recommended before a real run.
+#
+# Requires the ansible.controller collection in the EE and a controller_api lookup
+# that reaches the controller through the AAP gateway.
+
+- name: "SOP 'delete_group_tree_and_hosts' (ACTION — DESTRUCTIVE): delete a group + its sub-tree and the hosts exclusive to it [target: localhost]"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    inventory_name: ""
+    group_name: ""
+    delete_hosts: true
+    force_delete_shared_hosts: false
+    dry_run: false
+    aap_gateway_ip: ""
+    aap_username: ""
+    aap_password: ""
+    aap_validate_certs: false
+
+  tasks:
+    - block:
+
+        - name: "Validate required variables"
+          ansible.builtin.assert:
+            that:
+              - "inventory_name | length > 0"
+              - "group_name | length > 0"
+              - "aap_gateway_ip | length > 0"
+              - "aap_username | length > 0"
+              - "aap_password | length > 0"
+            fail_msg: "Missing required variable(s): inventory_name, group_name, aap_gateway_ip, aap_username, aap_password"
+
+        - name: "Resolve inventory by name"
+          ansible.builtin.set_fact:
+            _inventory: >-
+              {{ query('ansible.controller.controller_api', 'inventories',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs,
+                       query_params={'name': inventory_name}, return_all=true) | flatten }}
+          no_log: true
+
+        - name: "Assert inventory exists"
+          ansible.builtin.assert:
+            that:
+              - "_inventory | length == 1"
+            fail_msg: "Inventory '{{ inventory_name }}' not found"
+
+        - name: "Set inventory ID"
+          ansible.builtin.set_fact:
+            _inventory_id: "{{ (_inventory | first).id }}"
+
+        - name: "Resolve the root group to delete"
+          ansible.builtin.set_fact:
+            _root_group: >-
+              {{ query('ansible.controller.controller_api', 'groups',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs,
+                       query_params={'name': group_name, 'inventory__name': inventory_name},
+                       return_all=true) | flatten }}
+          no_log: true
+
+        - name: "Assert the group exists"
+          ansible.builtin.assert:
+            that:
+              - "_root_group | length == 1"
+            fail_msg: "Group '{{ group_name }}' not found in inventory '{{ inventory_name }}'"
+
+        - name: "Set root group ID"
+          ansible.builtin.set_fact:
+            _root_id: "{{ (_root_group | first).id | string }}"
+
+        # ---- Discover the full sub-tree --------------------------------------
+        - name: "Fetch all groups in the inventory"
+          ansible.builtin.set_fact:
+            _all_groups: >-
+              {{ query('ansible.controller.controller_api', 'inventories/' ~ _inventory_id ~ '/groups/',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs, return_all=true) | flatten }}
+          no_log: true
+
+        - name: "Build adjacency map (direct children per group)"
+          ansible.builtin.set_fact:
+            _adj_map: >-
+              {{ (_adj_map | default({})) | combine({ (item.id | string): (
+                   query('ansible.controller.controller_api', 'groups/' ~ item.id ~ '/children/',
+                         host=aap_gateway_ip, username=aap_username, password=aap_password,
+                         verify_ssl=aap_validate_certs, return_all=true)
+                   | flatten | map(attribute='id') | map('string') | list) }) }}
+          loop: "{{ _all_groups }}"
+          loop_control:
+            label: "{{ item.name }}"
+          no_log: true
+
+        - name: "Build host map (direct hosts per group)"
+          ansible.builtin.set_fact:
+            _hosts_map: >-
+              {{ (_hosts_map | default({})) | combine({ (item.id | string): (
+                   query('ansible.controller.controller_api', 'groups/' ~ item.id ~ '/hosts/',
+                         host=aap_gateway_ip, username=aap_username, password=aap_password,
+                         verify_ssl=aap_validate_certs, return_all=true) | flatten) }) }}
+          loop: "{{ _all_groups }}"
+          loop_control:
+            label: "{{ item.name }}"
+          when: delete_hosts | bool
+          no_log: true
+
+        - name: "Initialize reachable set with the root group"
+          ansible.builtin.set_fact:
+            _reachable:
+              - "{{ _root_id }}"
+
+        - name: "Expand reachable set to the full sub-tree (bounded by group count; any depth, dedupes shared/cyclic)"
+          ansible.builtin.set_fact:
+            _reachable: "{{ (_reachable + (_reachable | map('extract', _adj_map) | flatten)) | unique }}"
+          loop: "{{ range(0, (_all_groups | length) + 1) | list }}"
+          loop_control:
+            label: "depth pass {{ item }} -> {{ _reachable | length }} groups"
+
+        - name: "Resolve the sub-tree groups, ids, and names"
+          ansible.builtin.set_fact:
+            _subtree_ids_int: "{{ _reachable | map('int') | list }}"
+            _subtree_group_names: "{{ _all_groups | selectattr('id', 'in', (_reachable | map('int') | list)) | map(attribute='name') | list }}"
+
+        # ---- Classify hosts (exclusive vs shared) ----------------------------
+        - name: "Collect and dedupe hosts across the sub-tree"
+          ansible.builtin.set_fact:
+            _subtree_hosts: >-
+              {{ (_all_groups | selectattr('id', 'in', _subtree_ids_int) | map(attribute='id') | map('string')
+                  | map('extract', _hosts_map) | flatten) | unique(attribute='id') | list }}
+          when: delete_hosts | bool
+
+        - name: "Classify each host as exclusive to the sub-tree or shared with an outside group"
+          ansible.builtin.set_fact:
+            _exclusive_host_names: "{{ (_exclusive_host_names | default([])) + ([item.name] if _is_exclusive else []) }}"
+            _shared_host_names: "{{ (_shared_host_names | default([])) + ([] if _is_exclusive else [item.name]) }}"
+          vars:
+            _member_group_ids: >-
+              {{ query('ansible.controller.controller_api', 'hosts/' ~ item.id ~ '/groups/',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs, return_all=true)
+                 | flatten | map(attribute='id') | map('int') | list }}
+            _is_exclusive: "{{ (_member_group_ids | difference(_subtree_ids_int)) | length == 0 }}"
+          loop: "{{ _subtree_hosts | default([]) }}"
+          loop_control:
+            label: "{{ item.name }}"
+          when: delete_hosts | bool
+          no_log: true
+
+        - name: "Decide which hosts to delete and which shared hosts to skip"
+          ansible.builtin.set_fact:
+            _hosts_to_delete: >-
+              {{ (_exclusive_host_names | default([]))
+                 + ((_shared_host_names | default([])) if (force_delete_shared_hosts | bool) else []) }}
+            _shared_skipped: "{{ [] if (force_delete_shared_hosts | bool) else (_shared_host_names | default([])) }}"
+
+        # ---- Delete (skipped entirely on dry_run) ----------------------------
+        - name: "Delete exclusive/forced hosts"
+          ansible.controller.host:
+            name: "{{ item }}"
+            inventory: "{{ inventory_name }}"
+            state: absent
+            controller_host: "https://{{ aap_gateway_ip }}"
+            controller_username: "{{ aap_username }}"
+            controller_password: "{{ aap_password }}"
+            validate_certs: "{{ aap_validate_certs | bool }}"
+          loop: "{{ _hosts_to_delete | default([]) }}"
+          loop_control:
+            label: "{{ item }}"
+          when:
+            - delete_hosts | bool
+            - not (dry_run | bool)
+
+        - name: "Delete every group in the sub-tree (removes groups and their associations)"
+          ansible.controller.group:
+            name: "{{ item }}"
+            inventory: "{{ inventory_name }}"
+            state: absent
+            controller_host: "https://{{ aap_gateway_ip }}"
+            controller_username: "{{ aap_username }}"
+            controller_password: "{{ aap_password }}"
+            validate_certs: "{{ aap_validate_certs | bool }}"
+          loop: "{{ _subtree_group_names }}"
+          loop_control:
+            label: "{{ item }}"
+          when: not (dry_run | bool)
+
+        # ---- Verify (only on a real run) -------------------------------------
+        - name: "VERIFY - re-read inventory group names"
+          ansible.builtin.set_fact:
+            _verify_names: >-
+              {{ query('ansible.controller.controller_api', 'inventories/' ~ _inventory_id ~ '/groups/',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs, return_all=true) | flatten | map(attribute='name') | list }}
+          when: not (dry_run | bool)
+          no_log: true
+
+        - name: "VERIFY - assert no sub-tree group remains"
+          ansible.builtin.assert:
+            that:
+              - "(_subtree_group_names | intersect(_verify_names)) | length == 0"
+            fail_msg: "Verification failed - still present in inventory: {{ _subtree_group_names | intersect(_verify_names) }}"
+            success_msg: "All {{ _subtree_group_names | length }} sub-tree group(s) removed."
+          when: not (dry_run | bool)
+
+        - name: "Emit result"
+          ansible.builtin.debug:
+            msg: |
+              <result>
+              inventory: {{ inventory_name }}
+              group_name: {{ group_name }}
+              dry_run: {{ dry_run | bool }}
+              deleted_groups: {{ _subtree_group_names | sort }}
+              deleted_group_count: {{ _subtree_group_names | length }}
+              delete_hosts: {{ delete_hosts | bool }}
+              deleted_hosts: {{ (_hosts_to_delete | default([])) | sort }}
+              skipped_shared_hosts: {{ (_shared_skipped | default([])) | sort }}
+              status: {{ 'DRY RUN - nothing was changed.' if (dry_run | bool) else 'Group sub-tree and exclusive hosts deleted.' }}
+              </result>
+
+      rescue:
+        - name: "Rescue - emit error result"
+          ansible.builtin.debug:
+            msg: |
+              <result>
+              ERROR: delete_group_tree_and_hosts failed on {{ inventory_hostname }} - {{ ansible_failed_task.name | default('unknown task') }}: {{ ansible_failed_result.msg | default('unknown error') }}
+              </result>
+
+        - name: "Rescue - fail playbook"
+          ansible.builtin.fail:
+            msg: "delete_group_tree_and_hosts failed"
