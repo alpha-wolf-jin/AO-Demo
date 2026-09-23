@@ -1,0 +1,188 @@
+---
+# create_subgroup_and_add_hosts.yml
+#
+# Create a sub-group under an existing group in an AAP inventory, and add host(s)
+# to the sub-group.
+#
+# Behavior / assumptions:
+#   * The PARENT group must already exist in the inventory (the play fails if not).
+#   * Hosts are ENSURED to exist in the inventory (created if missing), then
+#     associated with the sub-group. Set a strict pre-existence check instead if
+#     you'd rather fail on unknown host names (see note in the accompanying message).
+#   * `hosts` is a list of host NAMES (strings). Host variables/description are not
+#     set here — easy to extend if needed.
+#   * Idempotent: re-running updates the sub-group rather than duplicating it, and
+#     linking preserves the parent's existing children and hosts.
+#
+# Uses the ansible.controller.controller_api LOOKUP for reads (gateway-aware
+# collection required); the host/group MODULES for writes.
+
+- name: "SOP 'create_subgroup_and_add_hosts' (ACTION — changes state): create a sub-group under an existing group and add host(s) to it [target: localhost]"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    inventory_name: ""
+    parent_group: ""
+    subgroup_name: ""
+    subgroup_description: ""
+    subgroup_variables: {}
+    hosts: []
+    aap_gateway_ip: ""
+    aap_username: ""
+    aap_password: ""
+    aap_validate_certs: false
+
+  tasks:
+    - block:
+
+        - name: "Validate required variables"
+          ansible.builtin.assert:
+            that:
+              - "inventory_name | length > 0"
+              - "parent_group | length > 0"
+              - "subgroup_name | length > 0"
+              - "aap_gateway_ip | length > 0"
+              - "aap_username | length > 0"
+              - "aap_password | length > 0"
+            fail_msg: "Missing required variable(s): inventory_name, parent_group, subgroup_name, aap_gateway_ip, aap_username, aap_password"
+
+        - name: "Resolve inventory by name"
+          ansible.builtin.set_fact:
+            _inventory: >-
+              {{ query('ansible.controller.controller_api', 'inventories',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs,
+                       query_params={'name': inventory_name}, return_all=true) | flatten }}
+          no_log: true
+
+        - name: "Assert inventory exists"
+          ansible.builtin.assert:
+            that:
+              - "_inventory | length == 1"
+            fail_msg: "Inventory '{{ inventory_name }}' not found"
+
+        - name: "Resolve parent group in inventory"
+          ansible.builtin.set_fact:
+            _parent: >-
+              {{ query('ansible.controller.controller_api', 'groups',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs,
+                       query_params={'name': parent_group, 'inventory__name': inventory_name},
+                       return_all=true) | flatten }}
+          no_log: true
+
+        - name: "Assert parent group exists"
+          ansible.builtin.assert:
+            that:
+              - "_parent | length == 1"
+            fail_msg: "Parent group '{{ parent_group }}' not found in inventory '{{ inventory_name }}'"
+
+        - name: "Set parent group ID"
+          ansible.builtin.set_fact:
+            _parent_id: "{{ (_parent | first).id }}"
+
+        # ---- Create -----------------------------------------------------------
+        - name: "Ensure hosts exist in the inventory (created if missing)"
+          ansible.controller.host:
+            name: "{{ item }}"
+            inventory: "{{ inventory_name }}"
+            state: present
+            controller_host: "https://{{ aap_gateway_ip }}"
+            controller_username: "{{ aap_username }}"
+            controller_password: "{{ aap_password }}"
+            validate_certs: "{{ aap_validate_certs | bool }}"
+          loop: "{{ hosts }}"
+          loop_control:
+            label: "{{ item }}"
+          when: hosts | length > 0
+
+        - name: "Create the sub-group and associate its hosts"
+          ansible.controller.group:
+            name: "{{ subgroup_name }}"
+            description: "{{ subgroup_description | default('', true) }}"
+            inventory: "{{ inventory_name }}"
+            variables: "{{ subgroup_variables | default({}, true) }}"
+            hosts: "{{ hosts | default([]) }}"
+            preserve_existing_hosts: true
+            preserve_existing_children: true
+            state: present
+            controller_host: "https://{{ aap_gateway_ip }}"
+            controller_username: "{{ aap_username }}"
+            controller_password: "{{ aap_password }}"
+            validate_certs: "{{ aap_validate_certs | bool }}"
+
+        - name: "Link the sub-group under the parent group (existing children/hosts preserved)"
+          ansible.controller.group:
+            name: "{{ parent_group }}"
+            inventory: "{{ inventory_name }}"
+            children: "{{ [subgroup_name] }}"
+            preserve_existing_hosts: true
+            preserve_existing_children: true
+            state: present
+            controller_host: "https://{{ aap_gateway_ip }}"
+            controller_username: "{{ aap_username }}"
+            controller_password: "{{ aap_password }}"
+            validate_certs: "{{ aap_validate_certs | bool }}"
+
+        # ---- Verify -----------------------------------------------------------
+        - name: "VERIFY - re-read the parent's children"
+          ansible.builtin.set_fact:
+            _verify_children: >-
+              {{ query('ansible.controller.controller_api', 'groups/' ~ _parent_id ~ '/children/',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs, return_all=true)
+                 | flatten | map(attribute='name') | list }}
+          no_log: true
+
+        - name: "VERIFY - resolve the sub-group"
+          ansible.builtin.set_fact:
+            _subgroup: >-
+              {{ query('ansible.controller.controller_api', 'groups',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs,
+                       query_params={'name': subgroup_name, 'inventory__name': inventory_name},
+                       return_all=true) | flatten }}
+          no_log: true
+
+        - name: "VERIFY - re-read the sub-group's hosts"
+          ansible.builtin.set_fact:
+            _verify_hosts: >-
+              {{ query('ansible.controller.controller_api', 'groups/' ~ (_subgroup | first).id ~ '/hosts/',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs, return_all=true)
+                 | flatten | map(attribute='name') | list }}
+          when: _subgroup | length == 1
+          no_log: true
+
+        - name: "VERIFY - assert sub-group is linked and hosts are associated"
+          ansible.builtin.assert:
+            that:
+              - "_subgroup | length == 1"
+              - "subgroup_name in _verify_children"
+              - "(hosts | default([]) | difference(_verify_hosts | default([]))) | length == 0"
+            fail_msg: "Verification failed: sub-group not linked under parent, or one or more hosts not associated"
+            success_msg: "Sub-group '{{ subgroup_name }}' is under '{{ parent_group }}' with {{ hosts | default([]) | length }} host(s) associated"
+
+        - name: "Emit result"
+          ansible.builtin.debug:
+            msg: |
+              <result>
+              inventory: {{ inventory_name }}
+              parent_group: {{ parent_group }}
+              subgroup: {{ subgroup_name }}
+              added_hosts: {{ hosts | default([]) }}
+              status: Sub-group created and host(s) added successfully.
+              </result>
+
+      rescue:
+        - name: "Rescue - emit error result"
+          ansible.builtin.debug:
+            msg: |
+              <result>
+              ERROR: create_subgroup_and_add_hosts failed on {{ inventory_hostname }} - {{ ansible_failed_task.name | default('unknown task') }}: {{ ansible_failed_result.msg | default('unknown error') }}
+              </result>
+
+        - name: "Rescue - fail playbook"
+          ansible.builtin.fail:
+            msg: "create_subgroup_and_add_hosts failed"
