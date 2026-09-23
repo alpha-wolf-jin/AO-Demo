@@ -1,0 +1,308 @@
+---
+# migrate_group_recursive.yml
+#
+# COPY a group and its ENTIRE sub-group tree (any depth) from a source AAP
+# inventory to a target inventory. The source is KEPT (copy, not move).
+#
+# Destination:
+#   * target_parent_group empty  -> the migrated group lands at the TOP LEVEL of
+#     the target inventory.
+#   * target_parent_group set    -> the migrated group is nested UNDER that
+#     existing group in the target inventory.
+#
+# What is copied, for every group in the sub-tree:
+#   * group name, description, variables
+#   * directly-associated hosts, with their description, enabled state, variables
+#   * parent/child relationships (rebuilt in the target)
+#
+# Approach (order-independent, handles any depth + shared/cyclic subgroups):
+#   1. Discover: read every group in the source inventory plus each group's direct
+#      children and hosts, then expand the reachable set from the root to a fixpoint.
+#   2. Guard: refuse if a sub-tree group name already exists in the target
+#      (unless fail_on_collision=false).
+#   3. Create: ensure hosts exist, then create all sub-tree groups (pass 1), then
+#      link their children (pass 2) — so links never reference a not-yet-created group.
+#   4. Nest the root under target_parent_group if requested.
+#   5. Verify every sub-tree group is present in the target.
+#
+# Non-destructive: nothing is deleted from the source. Idempotent: re-running
+# re-asserts the same state.
+#
+# Requires the ansible.controller collection in the EE and a controller_api lookup
+# that reaches the controller through the AAP gateway.
+
+- name: "SOP 'migrate_group_recursive' (ACTION — copy): copy a group + its entire sub-tree between AAP inventories (optionally under a target group) [target: localhost]"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    source_inventory: ""
+    target_inventory: ""
+    group_name: ""
+    target_parent_group: ""      # optional; empty = top level of target inventory
+    fail_on_collision: true
+    aap_gateway_ip: ""
+    aap_username: ""
+    aap_password: ""
+    aap_validate_certs: false
+
+  tasks:
+    - block:
+
+        - name: "Validate required variables"
+          ansible.builtin.assert:
+            that:
+              - "source_inventory | length > 0"
+              - "target_inventory | length > 0"
+              - "group_name | length > 0"
+              - "aap_gateway_ip | length > 0"
+              - "aap_username | length > 0"
+              - "aap_password | length > 0"
+            fail_msg: "Missing required variable(s): source_inventory, target_inventory, group_name, aap_gateway_ip, aap_username, aap_password"
+
+        - name: "Resolve source and target inventories"
+          ansible.builtin.set_fact:
+            _source_inv: >-
+              {{ query('ansible.controller.controller_api', 'inventories',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs,
+                       query_params={'name': source_inventory}, return_all=true) | flatten }}
+            _target_inv: >-
+              {{ query('ansible.controller.controller_api', 'inventories',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs,
+                       query_params={'name': target_inventory}, return_all=true) | flatten }}
+          no_log: true
+
+        - name: "Assert both inventories exist"
+          ansible.builtin.assert:
+            that:
+              - "_source_inv | length == 1"
+              - "_target_inv | length == 1"
+            fail_msg: "Source ('{{ source_inventory }}') or target ('{{ target_inventory }}') inventory not found"
+
+        - name: "Set inventory IDs"
+          ansible.builtin.set_fact:
+            _source_inv_id: "{{ (_source_inv | first).id }}"
+            _target_inv_id: "{{ (_target_inv | first).id }}"
+
+        - name: "Resolve source root group"
+          ansible.builtin.set_fact:
+            _root_group: >-
+              {{ query('ansible.controller.controller_api', 'groups',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs,
+                       query_params={'name': group_name, 'inventory__name': source_inventory},
+                       return_all=true) | flatten }}
+          no_log: true
+
+        - name: "Assert source group exists"
+          ansible.builtin.assert:
+            that:
+              - "_root_group | length == 1"
+            fail_msg: "Group '{{ group_name }}' not found in source inventory '{{ source_inventory }}'"
+
+        - name: "Set root group ID"
+          ansible.builtin.set_fact:
+            _root_id: "{{ (_root_group | first).id | string }}"
+
+        - name: "Resolve target parent group (only when nesting is requested)"
+          ansible.builtin.set_fact:
+            _target_parent: >-
+              {{ query('ansible.controller.controller_api', 'groups',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs,
+                       query_params={'name': target_parent_group, 'inventory__name': target_inventory},
+                       return_all=true) | flatten }}
+          when: target_parent_group | length > 0
+          no_log: true
+
+        - name: "Assert target parent group exists (only when nesting is requested)"
+          ansible.builtin.assert:
+            that:
+              - "_target_parent | length == 1"
+            fail_msg: "Target parent group '{{ target_parent_group }}' not found in target inventory '{{ target_inventory }}'"
+          when: target_parent_group | length > 0
+
+        # ---- Discovery: full source sub-tree ---------------------------------
+        - name: "Fetch all groups in the source inventory"
+          ansible.builtin.set_fact:
+            _all_src_groups: >-
+              {{ query('ansible.controller.controller_api', 'inventories/' ~ _source_inv_id ~ '/groups/',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs, return_all=true) | flatten }}
+          no_log: true
+
+        - name: "Build adjacency + child-name maps (direct children per group)"
+          ansible.builtin.set_fact:
+            _adj_map: >-
+              {{ (_adj_map | default({})) | combine({ (item.id | string): (_kids | map(attribute='id') | map('string') | list) }) }}
+            _child_names_map: >-
+              {{ (_child_names_map | default({})) | combine({ (item.id | string): (_kids | map(attribute='name') | list) }) }}
+          vars:
+            _kids: >-
+              {{ query('ansible.controller.controller_api', 'groups/' ~ item.id ~ '/children/',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs, return_all=true) | flatten }}
+          loop: "{{ _all_src_groups }}"
+          loop_control:
+            label: "{{ item.name }}"
+          no_log: true
+
+        - name: "Build host map (direct hosts per group, with attributes)"
+          ansible.builtin.set_fact:
+            _hosts_map: >-
+              {{ (_hosts_map | default({})) | combine({ (item.id | string): (
+                   query('ansible.controller.controller_api', 'groups/' ~ item.id ~ '/hosts/',
+                         host=aap_gateway_ip, username=aap_username, password=aap_password,
+                         verify_ssl=aap_validate_certs, return_all=true) | flatten) }) }}
+          loop: "{{ _all_src_groups }}"
+          loop_control:
+            label: "{{ item.name }}"
+          no_log: true
+
+        - name: "Initialize reachable set with the root group"
+          ansible.builtin.set_fact:
+            _reachable:
+              - "{{ _root_id }}"
+
+        - name: "Expand reachable set to the full sub-tree (bounded by group count; any depth, dedupes shared/cyclic)"
+          ansible.builtin.set_fact:
+            _reachable: "{{ (_reachable + (_reachable | map('extract', _adj_map) | flatten)) | unique }}"
+          loop: "{{ range(0, (_all_src_groups | length) + 1) | list }}"
+          loop_control:
+            label: "depth pass {{ item }} -> {{ _reachable | length }} groups"
+
+        - name: "Resolve the sub-tree groups and their names"
+          ansible.builtin.set_fact:
+            _subtree_groups: "{{ _all_src_groups | selectattr('id', 'in', (_reachable | map('int') | list)) | list }}"
+            _subtree_group_names: "{{ _all_src_groups | selectattr('id', 'in', (_reachable | map('int') | list)) | map(attribute='name') | list }}"
+
+        # ---- Collision guard --------------------------------------------------
+        - name: "Fetch existing group names in the target inventory"
+          ansible.builtin.set_fact:
+            _target_existing_names: >-
+              {{ query('ansible.controller.controller_api', 'inventories/' ~ _target_inv_id ~ '/groups/',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs, return_all=true) | flatten | map(attribute='name') | list }}
+          no_log: true
+
+        - name: "Assert no name collisions in target (unless fail_on_collision is false)"
+          ansible.builtin.assert:
+            that:
+              - "(not (fail_on_collision | bool)) or ((_subtree_group_names | intersect(_target_existing_names)) | length == 0)"
+            fail_msg: "Target already contains group name(s): {{ _subtree_group_names | intersect(_target_existing_names) }}. Set fail_on_collision=false to merge into them."
+
+        # ---- Create in target -------------------------------------------------
+        - name: "Ensure all sub-tree hosts exist in target (with description, enabled, variables)"
+          ansible.controller.host:
+            name: "{{ item.name }}"
+            inventory: "{{ target_inventory }}"
+            description: "{{ item.description | default('', true) }}"
+            enabled: "{{ item.enabled | default(true) }}"
+            variables: >-
+              {{ (item.variables | default('', true) | trim | from_yaml)
+                 if (item.variables | default('', true) | trim | length > 0) else {} }}
+            state: present
+            controller_host: "https://{{ aap_gateway_ip }}"
+            controller_username: "{{ aap_username }}"
+            controller_password: "{{ aap_password }}"
+            validate_certs: "{{ aap_validate_certs | bool }}"
+          # duplicates (a host in several groups) are harmless — host create is idempotent
+          loop: "{{ _subtree_groups | map(attribute='id') | map('string') | map('extract', _hosts_map) | flatten }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: "PASS 1 - create every sub-tree group in target (no child links yet)"
+          ansible.controller.group:
+            name: "{{ item.name }}"
+            description: "{{ item.description | default('', true) }}"
+            inventory: "{{ target_inventory }}"
+            variables: >-
+              {{ (item.variables | default('', true) | trim | from_yaml)
+                 if (item.variables | default('', true) | trim | length > 0) else {} }}
+            hosts: "{{ _hosts_map[item.id | string] | map(attribute='name') | list }}"
+            preserve_existing_hosts: true
+            preserve_existing_children: true
+            state: present
+            controller_host: "https://{{ aap_gateway_ip }}"
+            controller_username: "{{ aap_username }}"
+            controller_password: "{{ aap_password }}"
+            validate_certs: "{{ aap_validate_certs | bool }}"
+          loop: "{{ _subtree_groups }}"
+          loop_control:
+            label: "{{ item.name }}"
+
+        - name: "PASS 2 - link child subgroups (all children now exist in target)"
+          ansible.controller.group:
+            name: "{{ item.name }}"
+            inventory: "{{ target_inventory }}"
+            children: "{{ _child_names_map[item.id | string] }}"
+            preserve_existing_hosts: true
+            preserve_existing_children: true
+            state: present
+            controller_host: "https://{{ aap_gateway_ip }}"
+            controller_username: "{{ aap_username }}"
+            controller_password: "{{ aap_password }}"
+            validate_certs: "{{ aap_validate_certs | bool }}"
+          loop: "{{ _subtree_groups }}"
+          loop_control:
+            label: "{{ item.name }}"
+          when: _child_names_map[item.id | string] | length > 0
+
+        - name: "Nest the migrated root under the target parent group (when requested)"
+          ansible.controller.group:
+            name: "{{ target_parent_group }}"
+            inventory: "{{ target_inventory }}"
+            children: "{{ [group_name] }}"
+            preserve_existing_hosts: true
+            preserve_existing_children: true
+            state: present
+            controller_host: "https://{{ aap_gateway_ip }}"
+            controller_username: "{{ aap_username }}"
+            controller_password: "{{ aap_password }}"
+            validate_certs: "{{ aap_validate_certs | bool }}"
+          when: target_parent_group | length > 0
+
+        # ---- Verify (copy is additive — this is a completeness check) ----------
+        - name: "VERIFY - re-read target inventory group names"
+          ansible.builtin.set_fact:
+            _verify_target_names: >-
+              {{ query('ansible.controller.controller_api', 'inventories/' ~ _target_inv_id ~ '/groups/',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs, return_all=true) | flatten | map(attribute='name') | list }}
+          no_log: true
+
+        - name: "VERIFY - assert every sub-tree group is present in target"
+          ansible.builtin.assert:
+            that:
+              - "(_subtree_group_names | difference(_verify_target_names)) | length == 0"
+            fail_msg: "Verification failed - missing in target: {{ _subtree_group_names | difference(_verify_target_names) }}"
+            success_msg: "All {{ _subtree_group_names | length }} sub-tree group(s) present in target."
+
+        - name: "Emit result"
+          ansible.builtin.debug:
+            msg: |
+              <result>
+              group_name: {{ group_name }}
+              source_inventory: {{ source_inventory }}
+              target_inventory: {{ target_inventory }}
+              target_parent_group: {{ target_parent_group if (target_parent_group | length > 0) else '(top-level)' }}
+              migrated_groups: {{ _subtree_group_names | sort }}
+              migrated_group_count: {{ _subtree_group_names | length }}
+              migrated_hosts: {{ _subtree_groups | map(attribute='id') | map('string') | map('extract', _hosts_map) | flatten | map(attribute='name') | unique | sort }}
+              source_kept: true
+              status: Group sub-tree copied successfully.
+              </result>
+
+      rescue:
+        - name: "Rescue - emit error result"
+          ansible.builtin.debug:
+            msg: |
+              <result>
+              ERROR: migrate_group_recursive failed on {{ inventory_hostname }} - {{ ansible_failed_task.name | default('unknown task') }}: {{ ansible_failed_result.msg | default('unknown error') }}
+              </result>
+
+        - name: "Rescue - fail playbook"
+          ansible.builtin.fail:
+            msg: "migrate_group_recursive failed"
