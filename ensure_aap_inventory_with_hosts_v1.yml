@@ -5,7 +5,7 @@
   gather_facts: false
   vars:
     aap_gateway_ip: ""
-    aap_user: ""
+    aap_username: ""
     aap_password: ""
     organization_name: ""
     inventory_name: ""
