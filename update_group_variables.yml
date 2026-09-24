@@ -1,0 +1,162 @@
+---
+# update_group_variables.yml
+#
+# Add or update the variables on a group in an AAP inventory.
+#
+# Because the ansible.controller.group module REPLACES a group's entire variables
+# block, "add/update" is implemented as read -> merge -> write: the group's current
+# variables are read, the supplied variables are merged in, and the result is written
+# back. So existing variables you don't mention are preserved.
+#
+# Modes:
+#   * default (merge)          : add new keys, update supplied keys, keep the rest.
+#   * recursive_merge=true     : deep-merge nested dicts instead of replacing them at
+#                                the top level.
+#   * replace_all=true         : overwrite the ENTIRE variables block with the
+#                                supplied variables (removes anything not supplied).
+#
+# Removing individual variables is not covered by merge mode; use replace_all with the
+# full desired set to drop keys.
+#
+# Non-destructive to hosts/children (only variables are changed). Idempotent.
+# Requires the ansible.controller collection in the EE and a controller_api lookup
+# that reaches the controller through the AAP gateway.
+
+- name: "SOP 'update_group_variables' (ACTION — changes state): add/update variables on a group in an AAP inventory [target: localhost]"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    inventory_name: ""
+    group_name: ""
+    group_variables: {}          # dict, or a YAML/JSON string, of vars to add/update
+    replace_all: false
+    recursive_merge: false
+    aap_gateway_ip: ""
+    aap_username: ""
+    aap_password: ""
+    aap_validate_certs: false
+
+  tasks:
+    - block:
+
+        - name: "Validate required variables"
+          ansible.builtin.assert:
+            that:
+              - "inventory_name | length > 0"
+              - "group_name | length > 0"
+              - "group_variables | length > 0"
+              - "aap_gateway_ip | length > 0"
+              - "aap_username | length > 0"
+              - "aap_password | length > 0"
+            fail_msg: "Missing required variable(s): inventory_name, group_name, group_variables (non-empty), aap_gateway_ip, aap_username, aap_password"
+
+        - name: "Resolve inventory by name"
+          ansible.builtin.set_fact:
+            _inventory: >-
+              {{ query('ansible.controller.controller_api', 'inventories',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs,
+                       query_params={'name': inventory_name}, return_all=true) | flatten }}
+          no_log: true
+
+        - name: "Assert inventory exists"
+          ansible.builtin.assert:
+            that:
+              - "_inventory | length == 1"
+            fail_msg: "Inventory '{{ inventory_name }}' not found"
+
+        - name: "Resolve the group in the inventory"
+          ansible.builtin.set_fact:
+            _group: >-
+              {{ query('ansible.controller.controller_api', 'groups',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs,
+                       query_params={'name': group_name, 'inventory__name': inventory_name},
+                       return_all=true) | flatten }}
+          no_log: true
+
+        - name: "Assert the group exists"
+          ansible.builtin.assert:
+            that:
+              - "_group | length == 1"
+            fail_msg: "Group '{{ group_name }}' not found in inventory '{{ inventory_name }}'"
+
+        # ---- Normalize inputs -------------------------------------------------
+        - name: "Normalize supplied and existing variables to dicts"
+          ansible.builtin.set_fact:
+            _new_vars: "{{ group_variables if (group_variables is mapping) else (group_variables | from_yaml) }}"
+            _existing_vars: >-
+              {{ ((_group | first).variables | default('', true) | trim | from_yaml)
+                 if ((_group | first).variables | default('', true) | trim | length > 0) else {} }}
+
+        - name: "Compute the merged variables"
+          ansible.builtin.set_fact:
+            _merged_vars: >-
+              {{ _new_vars
+                 if (replace_all | bool)
+                 else (_existing_vars | combine(_new_vars, recursive=(recursive_merge | bool))) }}
+            _added_keys: "{{ _new_vars.keys() | difference(_existing_vars.keys()) | list }}"
+            _updated_keys: "{{ _new_vars.keys() | intersect(_existing_vars.keys()) | list }}"
+
+        # ---- Apply ------------------------------------------------------------
+        - name: "Write the merged variables back to the group (hosts/children untouched)"
+          ansible.controller.group:
+            name: "{{ group_name }}"
+            inventory: "{{ inventory_name }}"
+            variables: "{{ _merged_vars }}"
+            preserve_existing_hosts: true
+            preserve_existing_children: true
+            state: present
+            controller_host: "https://{{ aap_gateway_ip }}"
+            controller_username: "{{ aap_username }}"
+            controller_password: "{{ aap_password }}"
+            validate_certs: "{{ aap_validate_certs | bool }}"
+
+        # ---- Verify -----------------------------------------------------------
+        - name: "VERIFY - re-read the group's variables"
+          ansible.builtin.set_fact:
+            _verify_vars: >-
+              {{ (_vg | first).variables | default('{}', true) | trim | from_yaml }}
+          vars:
+            _vg: >-
+              {{ query('ansible.controller.controller_api', 'groups',
+                       host=aap_gateway_ip, username=aap_username, password=aap_password,
+                       verify_ssl=aap_validate_certs,
+                       query_params={'name': group_name, 'inventory__name': inventory_name},
+                       return_all=true) | flatten }}
+          no_log: true
+
+        - name: "VERIFY - assert the variables were applied"
+          ansible.builtin.assert:
+            that:
+              - >-
+                (_verify_vars == _new_vars) if (replace_all | bool)
+                else ((_verify_vars | combine(_new_vars, recursive=(recursive_merge | bool))) == _verify_vars)
+            fail_msg: "Verification failed: group variables do not reflect the requested change"
+            success_msg: "Group '{{ group_name }}' variables updated ({{ _added_keys | length }} added, {{ _updated_keys | length }} updated)"
+
+        - name: "Emit result"
+          ansible.builtin.debug:
+            msg: |
+              <result>
+              inventory: {{ inventory_name }}
+              group_name: {{ group_name }}
+              mode: {{ 'replace_all' if (replace_all | bool) else ('recursive_merge' if (recursive_merge | bool) else 'merge') }}
+              added_keys: {{ _added_keys | sort }}
+              updated_keys: {{ _updated_keys | sort }}
+              variable_count: {{ _verify_vars | length }}
+              status: Group variables updated successfully.
+              </result>
+
+      rescue:
+        - name: "Rescue - emit error result"
+          ansible.builtin.debug:
+            msg: |
+              <result>
+              ERROR: update_group_variables failed on {{ inventory_hostname }} - {{ ansible_failed_task.name | default('unknown task') }}: {{ ansible_failed_result.msg | default('unknown error') }}
+              </result>
+
+        - name: "Rescue - fail playbook"
+          ansible.builtin.fail:
+            msg: "update_group_variables failed"
