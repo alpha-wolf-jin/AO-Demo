@@ -20,18 +20,18 @@
           ansible.builtin.assert:
             that:
               - "aap_gateway_ip | length > 0"
-              - "aap_user | length > 0"
+              - "aap_username | length > 0"
               - "aap_password | length > 0"
               - "organization_name | length > 0"
               - "inventory_name | length > 0"
-            fail_msg: "Required extra_vars must be provided: aap_gateway_ip, aap_user, aap_password, organization_name, inventory_name"
+            fail_msg: "Required extra_vars must be provided: aap_gateway_ip, aap_username, aap_password, organization_name, inventory_name"
 
         - name: "Req step-01 - Ensure organization exists"
           ansible.controller.organization:
             name: "{{ organization_name }}"
             state: present
             controller_host: "https://{{ aap_gateway_ip }}"
-            controller_username: "{{ aap_user }}"
+            controller_username: "{{ aap_username }}"
             controller_password: "{{ aap_password }}"
             validate_certs: false
           register: _organization_result
@@ -43,7 +43,7 @@
             organization: "{{ organization_name }}"
             state: present
             controller_host: "https://{{ aap_gateway_ip }}"
-            controller_username: "{{ aap_user }}"
+            controller_username: "{{ aap_username }}"
             controller_password: "{{ aap_password }}"
             validate_certs: false
           register: _inventory_result
@@ -63,7 +63,7 @@
             state: present
             variables: "{{ (host_variables | default({}))[item] if ((host_variables | default({}))[item] | default({}) | length) > 0 else omit }}"
             controller_host: "https://{{ aap_gateway_ip }}"
-            controller_username: "{{ aap_user }}"
+            controller_username: "{{ aap_username }}"
             controller_password: "{{ aap_password }}"
             validate_certs: false
           loop: "{{ _hosts_list_parsed | default([]) }}"
@@ -81,7 +81,7 @@
             hosts: "{{ _hosts_list_parsed | default([]) if (_hosts_list_parsed | default([]) | length) > 0 else omit }}"
             preserve_existing_hosts: true
             controller_host: "https://{{ aap_gateway_ip }}"
-            controller_username: "{{ aap_user }}"
+            controller_username: "{{ aap_username }}"
             controller_password: "{{ aap_password }}"
             validate_certs: false
           register: _group_result
@@ -100,7 +100,7 @@
             state: present
             variables: "{{ (host_variables | default({}))[item] if ((host_variables | default({}))[item] | default({}) | length) > 0 else omit }}"
             controller_host: "https://{{ aap_gateway_ip }}"
-            controller_username: "{{ aap_user }}"
+            controller_username: "{{ aap_username }}"
             controller_password: "{{ aap_password }}"
             validate_certs: false
           loop: "{{ _hosts_list_parsed | default([]) }}"
@@ -115,7 +115,7 @@
             _verified_org: >-
               {{ query('ansible.controller.controller_api', 'organizations',
                    host=aap_gateway_ip,
-                   username=aap_user,
+                   username=aap_username,
                    password=aap_password,
                    verify_ssl=false,
                    query_params={'name': organization_name},
@@ -123,7 +123,7 @@
             _verified_inventory: >-
               {{ query('ansible.controller.controller_api', 'inventories',
                    host=aap_gateway_ip,
-                   username=aap_user,
+                   username=aap_username,
                    password=aap_password,
                    verify_ssl=false,
                    query_params={'name': inventory_name, 'organization__name': organization_name},
@@ -149,7 +149,7 @@
             _verified_group: >-
               {{ query('ansible.controller.controller_api', 'groups',
                    host=aap_gateway_ip,
-                   username=aap_user,
+                   username=aap_username,
                    password=aap_password,
                    verify_ssl=false,
                    query_params={'name': group_name, 'inventory': _verified_inventory_id},
@@ -169,7 +169,7 @@
             _verified_host_names: >-
               {{ query('ansible.controller.controller_api', 'hosts',
                    host=aap_gateway_ip,
-                   username=aap_user,
+                   username=aap_username,
                    password=aap_password,
                    verify_ssl=false,
                    query_params={'inventory': _verified_inventory_id},
