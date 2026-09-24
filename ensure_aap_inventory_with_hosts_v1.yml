@@ -12,6 +12,7 @@
     group_name: ""
     group_variables: {}
     hosts_list: ""
+    host_variables: {}
 
   tasks:
     - block:
@@ -60,6 +61,7 @@
             name: "{{ item }}"
             inventory: "{{ inventory_name }}"
             state: present
+            variables: "{{ (host_variables | default({}))[item] if ((host_variables | default({}))[item] | default({}) | length) > 0 else omit }}"
             controller_host: "https://{{ aap_gateway_ip }}"
             controller_username: "{{ aap_user }}"
             controller_password: "{{ aap_password }}"
@@ -96,6 +98,7 @@
             name: "{{ item }}"
             inventory: "{{ inventory_name }}"
             state: present
+            variables: "{{ (host_variables | default({}))[item] if ((host_variables | default({}))[item] | default({}) | length) > 0 else omit }}"
             controller_host: "https://{{ aap_gateway_ip }}"
             controller_username: "{{ aap_user }}"
             controller_password: "{{ aap_password }}"
@@ -195,6 +198,7 @@
               group_name: {{ group_name }}
               group_variables: {{ group_variables | to_json }}
               hosts_list: {{ hosts_list }}
+              host_variables: {{ host_variables | to_json }}
               status: success
               </result>
           when: true
