@@ -1,0 +1,212 @@
+---
+- name: "SOP playbook 'ensure_aap_inventory_with_hosts' (ACTION — changes system state): Ensure an AAP organization, inventory, and optionally a group with hosts (or hosts directly in the inventory) exist in the controller. [target host: localhost (localhost)]"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    aap_gateway_ip: ""
+    aap_user: ""
+    aap_password: ""
+    organization_name: ""
+    inventory_name: ""
+    group_name: ""
+    group_variables: {}
+    hosts_list: ""
+
+  tasks:
+    - block:
+        - name: "Validate required variables are provided"
+          ansible.builtin.assert:
+            that:
+              - "aap_gateway_ip | length > 0"
+              - "aap_user | length > 0"
+              - "aap_password | length > 0"
+              - "organization_name | length > 0"
+              - "inventory_name | length > 0"
+            fail_msg: "Required extra_vars must be provided: aap_gateway_ip, aap_user, aap_password, organization_name, inventory_name"
+
+        - name: "Req step-01 - Ensure organization exists"
+          ansible.controller.organization:
+            name: "{{ organization_name }}"
+            state: present
+            controller_host: "https://{{ aap_gateway_ip }}"
+            controller_username: "{{ aap_user }}"
+            controller_password: "{{ aap_password }}"
+            validate_certs: false
+          register: _organization_result
+          no_log: true
+
+        - name: "Req step-02 - Ensure inventory exists"
+          ansible.controller.inventory:
+            name: "{{ inventory_name }}"
+            organization: "{{ organization_name }}"
+            state: present
+            controller_host: "https://{{ aap_gateway_ip }}"
+            controller_username: "{{ aap_user }}"
+            controller_password: "{{ aap_password }}"
+            validate_certs: false
+          register: _inventory_result
+          no_log: true
+
+        - name: "Req step-03 - Set group name provided and prepare host list"
+          ansible.builtin.set_fact:
+            _group_name_provided: "{{ (group_name | default('') | trim | length) > 0 }}"
+            _hosts_provided: "{{ (hosts_list | default('') | trim | length) > 0 }}"
+            _hosts_list_parsed: "{{ (hosts_list | default('') | trim).split(',') | map('trim') | reject('equalto', '') | list }}"
+          when: true
+
+        - name: "Req step-04 - Ensure hosts exist in inventory for group"
+          ansible.controller.host:
+            name: "{{ item }}"
+            inventory: "{{ inventory_name }}"
+            state: present
+            controller_host: "https://{{ aap_gateway_ip }}"
+            controller_username: "{{ aap_user }}"
+            controller_password: "{{ aap_password }}"
+            validate_certs: false
+          loop: "{{ _hosts_list_parsed | default([]) }}"
+          when:
+            - "_group_name_provided | bool"
+            - "_hosts_provided | bool"
+          no_log: true
+
+        - name: "Req step-04 - Ensure group and its hosts exist"
+          ansible.controller.group:
+            name: "{{ group_name }}"
+            inventory: "{{ inventory_name }}"
+            state: present
+            variables: "{{ group_variables if (group_variables | default({}) | length) > 0 else omit }}"
+            hosts: "{{ _hosts_list_parsed | default([]) if (_hosts_list_parsed | default([]) | length) > 0 else omit }}"
+            preserve_existing_hosts: true
+            controller_host: "https://{{ aap_gateway_ip }}"
+            controller_username: "{{ aap_user }}"
+            controller_password: "{{ aap_password }}"
+            validate_certs: false
+          register: _group_result
+          when: "_group_name_provided | bool"
+          no_log: true
+
+        - name: "Req step-05 - Set hosts provided flag"
+          ansible.builtin.set_fact:
+            _hosts_provided: "{{ (hosts_list | default('') | trim | length) > 0 }}"
+          when: "not (_group_name_provided | bool)"
+
+        - name: "Req step-06 - Ensure hosts exist directly in inventory"
+          ansible.controller.host:
+            name: "{{ item }}"
+            inventory: "{{ inventory_name }}"
+            state: present
+            controller_host: "https://{{ aap_gateway_ip }}"
+            controller_username: "{{ aap_user }}"
+            controller_password: "{{ aap_password }}"
+            validate_certs: false
+          loop: "{{ _hosts_list_parsed | default([]) }}"
+          register: _host_results
+          when:
+            - "_hosts_provided | bool"
+            - "not (_group_name_provided | bool)"
+          no_log: true
+
+        - name: "Req step-07 - Verify organization and inventory exist"
+          ansible.builtin.set_fact:
+            _verified_org: >-
+              {{ query('ansible.controller.controller_api', 'organizations',
+                   host=aap_gateway_ip,
+                   username=aap_user,
+                   password=aap_password,
+                   verify_ssl=false,
+                   query_params={'name': organization_name},
+                   return_all=true) | flatten }}
+            _verified_inventory: >-
+              {{ query('ansible.controller.controller_api', 'inventories',
+                   host=aap_gateway_ip,
+                   username=aap_user,
+                   password=aap_password,
+                   verify_ssl=false,
+                   query_params={'name': inventory_name, 'organization__name': organization_name},
+                   return_all=true) | flatten }}
+          when: true
+          no_log: true
+
+        - name: "Req step-07 - Resolve inventory ID from verified inventory"
+          ansible.builtin.set_fact:
+            _verified_inventory_id: "{{ (_verified_inventory | first).id | string if (_verified_inventory | default([]) | length) > 0 else '' }}"
+          when: true
+
+        - name: "Req step-07 - Assert organization and inventory exist"
+          ansible.builtin.assert:
+            that:
+              - "(_verified_org | default([]) | length) > 0"
+              - "(_verified_inventory | default([]) | length) > 0"
+            fail_msg: "Verification failed: organization or inventory not found after ensure"
+          when: true
+
+        - name: "Req step-07 - Look up group"
+          ansible.builtin.set_fact:
+            _verified_group: >-
+              {{ query('ansible.controller.controller_api', 'groups',
+                   host=aap_gateway_ip,
+                   username=aap_user,
+                   password=aap_password,
+                   verify_ssl=false,
+                   query_params={'name': group_name, 'inventory': _verified_inventory_id},
+                   return_all=true) | flatten }}
+          when: "_group_name_provided | bool"
+          no_log: true
+
+        - name: "Req step-07 - Assert group exists"
+          ansible.builtin.assert:
+            that:
+              - "(_verified_group | default([]) | length) > 0"
+            fail_msg: "Group '{{ group_name }}' not found in inventory '{{ inventory_name }}' after ensure"
+          when: "_group_name_provided | bool"
+
+        - name: "Req step-07 - Look up hosts in inventory"
+          ansible.builtin.set_fact:
+            _verified_host_names: >-
+              {{ query('ansible.controller.controller_api', 'hosts',
+                   host=aap_gateway_ip,
+                   username=aap_user,
+                   password=aap_password,
+                   verify_ssl=false,
+                   query_params={'inventory': _verified_inventory_id},
+                   return_all=true) | flatten
+                   | map(attribute='name') | list }}
+          when:
+            - "_hosts_provided | bool"
+            - "_verified_inventory_id | length > 0"
+          no_log: true
+
+        - name: "Req step-07 - Assert expected hosts exist in inventory"
+          ansible.builtin.assert:
+            that:
+              - "(_hosts_list_parsed | default([]) | difference(_verified_host_names | default([])) | length) == 0"
+            fail_msg: "Hosts missing from inventory: {{ _hosts_list_parsed | difference(_verified_host_names | default([])) | join(', ') }}"
+          when:
+            - "_hosts_provided | bool"
+            - "_verified_inventory_id | length > 0"
+
+        - name: "Req step-07 - Emit result block"
+          ansible.builtin.debug:
+            msg: |
+              <result>
+              organization_name: {{ organization_name }}
+              inventory_name: {{ inventory_name }}
+              group_name: {{ group_name }}
+              group_variables: {{ group_variables | to_json }}
+              hosts_list: {{ hosts_list }}
+              status: success
+              </result>
+          when: true
+
+      rescue:
+        - name: "Req step-08 - Emit error result block"
+          ansible.builtin.debug:
+            msg: |
+              <result>
+              ERROR: ensure_aap_inventory_with_hosts failed on {{ inventory_hostname }} - {{ ansible_failed_task.name | default('unknown_task') }}: {{ ansible_failed_result.msg | default('unknown error') }}
+              </result>
+
+        - name: "Req step-08 - Force playbook failure"
+          ansible.builtin.fail:
+            msg: "ensure_aap_inventory_with_hosts failed"
