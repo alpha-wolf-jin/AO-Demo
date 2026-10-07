@@ -1,5 +1,5 @@
 ---
-- name: Generate requirements.txt from SBOM Python packages
+- name: Query PyPI for latest versions of SBOM Python libraries
   hosts: localhost
   connection: local
   gather_facts: false
@@ -7,8 +7,8 @@
   vars:
     # Path to the input JSON file
     report_file: "report-CVE-2026-19553-426dad8ba33a733e675008fe53168a77.json"
-    # Output file path
-    requirements_file: "requirements.txt"
+    # Path to save the detailed output report
+    output_file: "python_libraries_comparison.json"
     # PyPI Simple Index URL
     pypi_index_url: "https://pypi.python.org/simple"
 
@@ -43,27 +43,36 @@
       changed_when: false
       failed_when: false
 
-    - name: Build requirement lines list
+    - name: Parse pip index outputs and compare versions
       ansible.builtin.set_fact:
-        req_lines: >-
+        pkg_version_comparison: >-
           {{
-            req_lines | default([]) + [
-              (
-                item.item.name ~ '>=' ~ (item.stdout | regex_search('\(([^)]+)\)', '\1') | first)
-              ) if (item.rc == 0 and item.stdout is match('.*\(.*\).*'))
-              else (item.item.name ~ '>=' ~ item.item.version)
+            pkg_version_comparison | default([]) + [
+              {
+                'name': item.item.name,
+                'installed_version': item.item.version,
+                'latest_version': (
+                  item.stdout | regex_search(item.item.name ~ ' \(([^)]+)\)', '\1') | first
+                ) if (item.rc == 0 and item.stdout is match('.*\(.*\).*')) else 'N/A',
+                'purl': item.item.purl,
+                'raw_pip_output': item.stdout if item.rc == 0 else item.stderr
+              }
             ]
           }}
       loop: "{{ pip_results.results }}"
       loop_control:
         label: "{{ item.item.name }}"
 
-    - name: Display generated requirements.txt content
+    - name: Display package version summary
       ansible.builtin.debug:
-        msg: "{{ req_lines }}"
+        msg: >-
+          Package: {{ item.name }} | Installed: {{ item.installed_version }} | Latest PyPI: {{ item.latest_version }}
+      loop: "{{ pkg_version_comparison }}"
+      loop_control:
+        label: "{{ item.name }}"
 
-    - name: Save requirements.txt file
+    - name: Save version comparison to JSON file
       ansible.builtin.copy:
-        content: "{{ req_lines | join('\n') ~ '\n' }}"
-        dest: "{{ requirements_file }}"
+        content: "{{ pkg_version_comparison | to_nice_json }}"
+        dest: "{{ output_file }}"
         mode: '0644'
