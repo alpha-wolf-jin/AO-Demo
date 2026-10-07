@@ -35,7 +35,7 @@
 
     - name: Query latest version via pip index versions
       ansible.builtin.command:
-        cmd: "pip index versions {{ item.name }} --index-url {{ pypi_index_url }}"
+        cmd: "pip3 index versions {{ item.name }} --index-url {{ pypi_index_url }}"
       loop: "{{ python_pkgs }}"
       loop_control:
         label: "{{ item.name }}"
