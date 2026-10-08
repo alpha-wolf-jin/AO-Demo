@@ -1,16 +1,20 @@
 ---
-- name: Generate requirements.txt from SBOM Python packages
+- name: Generate requirements.txt and push to Git
   hosts: localhost
   connection: local
   gather_facts: false
 
   vars:
-    # Path to the input JSON file
     report_file: "report-CVE-2026-19553-426dad8ba33a733e675008fe53168a77.json"
-    # Output file path
     requirements_file: "requirements.txt"
-    # PyPI Simple Index URL
     pypi_index_url: "https://pypi.python.org/simple"
+
+    # Fetch secrets safely from environment variables
+    # git_repo_url: "https://github.com/alpha-wolf-jin/AO-Demo.git"
+    git_repo_url: "https://github.com/alpha-wolf-jin/AO-Demo.git"
+    git_user: "{{ lookup('env', 'GIT_USER') | default('alpha-wolf-jin', true) }}"
+    git_token: "{{ lookup('env', 'GIT_TOKEN') }}"
+    git_dir: "./AO-Demo"
 
   tasks:
     - name: Read report JSON file
@@ -22,14 +26,14 @@
       ansible.builtin.set_fact:
         report_data: "{{ report_raw.content | b64decode | from_json }}"
 
-    - name: Extract unique Python packages from sbom_info
+    - name: Extract unique Python packages by name
       ansible.builtin.set_fact:
         python_pkgs: >-
           {{
             report_data.input.image.sbom_info.packages
             | selectattr('system', 'defined')
             | selectattr('system', 'equalto', 'python')
-            | unique
+            | unique(attribute='name')
             | list
           }}
 
@@ -43,55 +47,76 @@
       changed_when: false
       failed_when: false
 
-    - name: Parse pip index outputs and compare versions
-      ansible.builtin.set_fact:
-        pkg_version_comparison: >-
-          {{
-            pkg_version_comparison | default([]) + [
-              {
-                'name': item.item.name,
-                'installed_version': item.item.version,
-                'latest_version': (
-                  item.stdout | regex_search(item.item.name ~ ' \(([^)]+)\)', '\1') | first
-                ) if (item.rc == 0 and item.stdout is match('.*\(.*\).*')) else 'N/A',
-                'purl': item.item.purl,
-                'raw_pip_output': item.stdout if item.rc == 0 else item.stderr
-              }
-            ]
-          }}
-      loop: "{{ pip_results.results }}"
-      loop_control:
-        label: "{{ item.item.name }}"
-
-    - name: Display package version summary
-      ansible.builtin.debug:
-        msg: >-
-          Package: {{ item.name }} | Installed: {{ item.installed_version }} | Latest PyPI: {{ item.latest_version }}
-      loop: "{{ pkg_version_comparison }}"
-      loop_control:
-        label: "{{ item.name }}"
-
-    - name: Build requirement lines list
+    - name: Build deduplicated requirement lines list
       ansible.builtin.set_fact:
         req_lines: >-
           {{
-            req_lines | default([]) + [
-              (
-                item.item.name ~ '>=' ~ (item.stdout | regex_search('\(([^)]+)\)', '\1') | first)
-              ) if (item.rc == 0 and item.stdout is match('.*\(.*\).*'))
-              else (item.item.name ~ '>=' ~ item.item.version)
-            ]
+            (
+              req_lines | default([]) + [
+                (
+                  item.item.name ~ '>=' ~ (item.stdout | regex_search('\(([^)]+)\)', '\1') | first)
+                ) if (item.rc == 0 and item.stdout is match('.*\(.*\).*'))
+                else (item.item.name ~ '>=' ~ item.item.version)
+              ]
+            ) | unique | sort
           }}
       loop: "{{ pip_results.results }}"
       loop_control:
         label: "{{ item.item.name }}"
 
-    - name: Display generated requirements.txt content
-      ansible.builtin.debug:
-        msg: "{{ req_lines }}"
-
-    - name: Save requirements.txt file
+    - name: Save requirements.txt file locally
       ansible.builtin.copy:
         content: "{{ req_lines | join('\n') ~ '\n' }}"
         dest: "{{ requirements_file }}"
         mode: '0644'
+
+    - name: Clone Git repository using credentials
+      ansible.builtin.git:
+        repo: "https://{{ git_user }}:{{ git_token }}@github.com/alpha-wolf-jin/AO-Demo.git"
+        dest: "{{ git_dir }}"
+        clone: true
+        update: true
+
+    - name: Copy requirements.txt to Git directory
+      ansible.builtin.copy:
+        src: "{{ requirements_file }}"
+        dest: "{{ git_dir }}/{{ requirements_file }}"
+        mode: '0644'
+
+    - name: Configure Git user details
+      ansible.builtin.command:
+        cmd: "git config user.name '{{ git_user }}'"
+        chdir: "{{ git_dir }}"
+      changed_when: false
+
+    - name: Configure Git email
+      ansible.builtin.command:
+        cmd: "git config user.email '{{ git_user }}@users.noreply.github.com'"
+        chdir: "{{ git_dir }}"
+      changed_when: false
+
+    - name: Add requirements.txt to Git index
+      ansible.builtin.command:
+        cmd: "git add {{ requirements_file }}"
+        chdir: "{{ git_dir }}"
+      register: git_add_out
+      changed_when: git_add_out.rc == 0
+
+    - name: Check Git status
+      ansible.builtin.command:
+        cmd: "git status --porcelain"
+        chdir: "{{ git_dir }}"
+      register: git_status
+      changed_when: false
+
+    - name: Commit requirements.txt if modified
+      ansible.builtin.command:
+        cmd: 'git commit -m "Update requirements.txt from SBOM scan report"'
+        chdir: "{{ git_dir }}"
+      when: git_status.stdout != ""
+
+    - name: Push changes to Git repository
+      ansible.builtin.command:
+        cmd: "git push origin HEAD"
+        chdir: "{{ git_dir }}"
+      when: git_status.stdout != ""

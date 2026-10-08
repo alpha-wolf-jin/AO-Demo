@@ -1,0 +1,97 @@
+---
+- name: Generate requirements.txt from SBOM Python packages
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    # Path to the input JSON file
+    report_file: "report-CVE-2026-19553-426dad8ba33a733e675008fe53168a77.json"
+    # Output file path
+    requirements_file: "requirements.txt"
+    # PyPI Simple Index URL
+    pypi_index_url: "https://pypi.python.org/simple"
+
+  tasks:
+    - name: Read report JSON file
+      ansible.builtin.slurp:
+        src: "{{ report_file }}"
+      register: report_raw
+
+    - name: Parse JSON content
+      ansible.builtin.set_fact:
+        report_data: "{{ report_raw.content | b64decode | from_json }}"
+
+    - name: Extract unique Python packages from sbom_info
+      ansible.builtin.set_fact:
+        python_pkgs: >-
+          {{
+            report_data.input.image.sbom_info.packages
+            | selectattr('system', 'defined')
+            | selectattr('system', 'equalto', 'python')
+            | unique
+            | list
+          }}
+
+    - name: Query latest version via pip index versions
+      ansible.builtin.command:
+        cmd: "/usr/bin/pip3.12 index versions {{ item.name }} --index-url {{ pypi_index_url }}"
+      loop: "{{ python_pkgs }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: pip_results
+      changed_when: false
+      failed_when: false
+
+    - name: Parse pip index outputs and compare versions
+      ansible.builtin.set_fact:
+        pkg_version_comparison: >-
+          {{
+            pkg_version_comparison | default([]) + [
+              {
+                'name': item.item.name,
+                'installed_version': item.item.version,
+                'latest_version': (
+                  item.stdout | regex_search(item.item.name ~ ' \(([^)]+)\)', '\1') | first
+                ) if (item.rc == 0 and item.stdout is match('.*\(.*\).*')) else 'N/A',
+                'purl': item.item.purl,
+                'raw_pip_output': item.stdout if item.rc == 0 else item.stderr
+              }
+            ]
+          }}
+      loop: "{{ pip_results.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: Display package version summary
+      ansible.builtin.debug:
+        msg: >-
+          Package: {{ item.name }} | Installed: {{ item.installed_version }} | Latest PyPI: {{ item.latest_version }}
+      loop: "{{ pkg_version_comparison }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Build requirement lines list
+      ansible.builtin.set_fact:
+        req_lines: >-
+          {{
+            req_lines | default([]) + [
+              (
+                item.item.name ~ '>=' ~ (item.stdout | regex_search('\(([^)]+)\)', '\1') | first)
+              ) if (item.rc == 0 and item.stdout is match('.*\(.*\).*'))
+              else (item.item.name ~ '>=' ~ item.item.version)
+            ]
+          }}
+      loop: "{{ pip_results.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: Display generated requirements.txt content
+      ansible.builtin.debug:
+        msg: "{{ req_lines }}"
+
+    - name: Save requirements.txt file
+      ansible.builtin.copy:
+        content: "{{ req_lines | join('\n') ~ '\n' }}"
+        dest: "{{ requirements_file }}"
+        mode: '0644'
