@@ -13,7 +13,7 @@
     # git_repo_url: "https://github.com/alpha-wolf-jin/AO-Demo.git"
     git_repo_url: "https://github.com/alpha-wolf-jin/AO-Demo.git"
     git_user: "{{ lookup('env', 'GIT_USER') | default('alpha-wolf-jin', true) }}"
-    git_token: "{{ lookup('env', 'GIT_TOKEN') }}"
+    #git_token: "{{ lookup('env', 'GIT_TOKEN') }}"
     git_dir: "./AO-Demo"
 
   tasks:
