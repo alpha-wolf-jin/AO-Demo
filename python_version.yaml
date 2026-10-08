@@ -43,6 +43,34 @@
       changed_when: false
       failed_when: false
 
+    - name: Parse pip index outputs and compare versions
+      ansible.builtin.set_fact:
+        pkg_version_comparison: >-
+          {{
+            pkg_version_comparison | default([]) + [
+              {
+                'name': item.item.name,
+                'installed_version': item.item.version,
+                'latest_version': (
+                  item.stdout | regex_search(item.item.name ~ ' \(([^)]+)\)', '\1') | first
+                ) if (item.rc == 0 and item.stdout is match('.*\(.*\).*')) else 'N/A',
+                'purl': item.item.purl,
+                'raw_pip_output': item.stdout if item.rc == 0 else item.stderr
+              }
+            ]
+          }}
+      loop: "{{ pip_results.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: Display package version summary
+      ansible.builtin.debug:
+        msg: >-
+          Package: {{ item.name }} | Installed: {{ item.installed_version }} | Latest PyPI: {{ item.latest_version }}
+      loop: "{{ pkg_version_comparison }}"
+      loop_control:
+        label: "{{ item.name }}"
+
     - name: Build requirement lines list
       ansible.builtin.set_fact:
         req_lines: >-
