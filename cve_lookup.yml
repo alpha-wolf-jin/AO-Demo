@@ -313,22 +313,22 @@
       ansible.builtin.debug:
         var: cve_record
 
-    - name: Publish record to downstream workflow nodes (AAP)
-      ansible.builtin.set_stats:
-        data:
-          cve_record: "{{ cve_record }}"
+    #- name: Publish record to downstream workflow nodes (AAP)
+    #  ansible.builtin.set_stats:
+    #    data:
+    #      cve_record: "{{ cve_record }}"
 
-    - name: Write JSON report
-      when: write_report | bool
-      block:
-        - name: Ensure report directory exists
-          ansible.builtin.file:
-            path: "{{ output_dir }}"
-            state: directory
-            mode: "0755"
+    #- name: Write JSON report
+    #  when: write_report | bool
+    #  block:
+    #    - name: Ensure report directory exists
+    #      ansible.builtin.file:
+    #        path: "{{ output_dir }}"
+    #        state: directory
+    #        mode: "0755"
 
-        - name: Write {{ cve }}.json
-          ansible.builtin.copy:
-            content: "{{ cve_record | to_nice_json(indent=2) }}\n"
-            dest: "{{ output_dir }}/{{ cve }}.json"
-            mode: "0644"
+    #    - name: Write {{ cve }}.json
+    #      ansible.builtin.copy:
+    #        content: "{{ cve_record | to_nice_json(indent=2) }}\n"
+    #        dest: "{{ output_dir }}/{{ cve }}.json"
+    #        mode: "0644"
