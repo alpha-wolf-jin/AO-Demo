@@ -480,10 +480,10 @@
       ansible.builtin.debug:
         var: cve_record
 
-    #- name: Publish record to downstream workflow nodes (AAP)
-    #  ansible.builtin.set_stats:
-    #    data:
-    #      cve_record: "{{ cve_record }}"
+    - name: Publish record to downstream workflow nodes (AAP)
+      ansible.builtin.set_stats:
+        data:
+          cve_record: "{{ cve_record }}"
 
     #- name: Write JSON report
     #  when: write_report | bool
