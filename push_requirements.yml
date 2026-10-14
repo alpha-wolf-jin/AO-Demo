@@ -1,0 +1,127 @@
+---
+# AAP workflow node (after Approval): commit the approved requirements files to git
+#
+#   check_cve_impact  ->  generate_requirements  ->  [Approval]  ->  push_requirements
+#
+# Input (artifact from generate_requirements via set_stats):
+#   requirements_bundle   list of {sbom_id, sbom_name, requirements_file, content}
+#   The content is written exactly as the approver reviewed it - nothing is regenerated here.
+#
+# Credential: custom "Git push token" credential that injects env GIT_USER and GIT_TOKEN.
+# The token is sent as an HTTP header via git config env vars, so it never appears in the
+# repo URL, .git/config or the job output.
+
+- name: Push approved requirements to Git
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    bundle: "{{ requirements_bundle | default([]) }}"
+    commit_cve: "{{ cve_impact_cve | default(cve_id | default('')) }}"
+
+    git_repo_url: "https://github.com/alpha-wolf-jin/AO-Demo.git"
+    git_branch: ""                     # empty = repository default branch
+    git_user: "{{ lookup('env', 'GIT_USER') | default('alpha-wolf-jin', true) }}"
+    git_token: "{{ lookup('env', 'GIT_TOKEN') }}"
+    git_dir: "/tmp/ao-demo-{{ awx_job_id | default('local') }}"
+
+  environment:
+    GIT_TERMINAL_PROMPT: "0"
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: "http.extraHeader"
+    GIT_CONFIG_VALUE_0: "Authorization: Basic {{ (git_user ~ ':' ~ git_token) | b64encode }}"
+
+  tasks:
+    - name: Check inputs
+      ansible.builtin.assert:
+        that:
+          - bundle | length > 0
+          - git_token | length > 0
+        fail_msg: >-
+          requirements_bundle is empty (did generate_requirements run before this node?)
+          or GIT_TOKEN is not set (attach the Git push token credential).
+        quiet: true
+
+    - name: Start from a clean working copy
+      ansible.builtin.file:
+        path: "{{ git_dir }}"
+        state: absent
+
+    - name: Clone repository
+      ansible.builtin.git:
+        repo: "{{ git_repo_url }}"
+        dest: "{{ git_dir }}"
+        version: "{{ git_branch | default('HEAD', true) }}"
+        depth: 1
+
+    - name: Configure commit identity
+      ansible.builtin.command:
+        cmd: "git config {{ item.key }} '{{ item.value }}'"
+        chdir: "{{ git_dir }}"
+      loop:
+        - { key: user.name,  value: "{{ git_user }}" }
+        - { key: user.email, value: "{{ git_user }}@users.noreply.github.com" }
+      changed_when: false
+
+    - name: Create parent directories for requirements files
+      ansible.builtin.file:
+        path: "{{ git_dir }}/{{ item.requirements_file | dirname }}"
+        state: directory
+        mode: "0755"
+      loop: "{{ bundle }}"
+      loop_control:
+        label: "{{ item.requirements_file }}"
+      when: item.requirements_file | dirname | length > 0
+
+    - name: Write approved requirements files
+      ansible.builtin.copy:
+        content: "{{ item.content }}"
+        dest: "{{ git_dir }}/{{ item.requirements_file }}"
+        mode: "0644"
+      loop: "{{ bundle }}"
+      loop_control:
+        label: "{{ item.requirements_file }} ({{ item.sbom_name }})"
+
+    - name: Stage files
+      ansible.builtin.command:
+        argv: ["git", "add", "--", "{{ item.requirements_file }}"]
+        chdir: "{{ git_dir }}"
+      loop: "{{ bundle }}"
+      loop_control:
+        label: "{{ item.requirements_file }}"
+      changed_when: false
+
+    - name: Check for staged changes
+      ansible.builtin.command:
+        cmd: git diff --cached --name-only
+        chdir: "{{ git_dir }}"
+      register: staged
+      changed_when: false
+
+    - name: Nothing to commit
+      ansible.builtin.debug:
+        msg: "Repository already contains the approved content - no commit made."
+      when: staged.stdout | length == 0
+
+    - name: Commit
+      ansible.builtin.command:
+        argv:
+          - git
+          - commit
+          - -m
+          - "{{ (commit_cve ~ ': ' if commit_cve else '') ~ 'update ' ~ (staged.stdout_lines | join(', ')) ~ ' from RHTPA SBOM audit' }}"
+          - -m
+          - "SBOMs: {{ bundle | map(attribute='sbom_name') | join(', ') }}\nApproved in AAP workflow job {{ awx_workflow_job_id | default('n/a') }}"
+        chdir: "{{ git_dir }}"
+      when: staged.stdout | length > 0
+
+    - name: Push
+      ansible.builtin.command:
+        cmd: "git push origin HEAD{{ (':' ~ git_branch) if git_branch | length > 0 else '' }}"
+        chdir: "{{ git_dir }}"
+      when: staged.stdout | length > 0
+
+    - name: Result
+      ansible.builtin.debug:
+        msg: "{{ 'Pushed: ' ~ (staged.stdout_lines | join(', ')) if staged.stdout | length > 0 else 'No changes pushed' }}"

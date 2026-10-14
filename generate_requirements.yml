@@ -1,0 +1,331 @@
+---
+# AAP workflow node: build a requirements proposal for human approval (NO git push)
+#
+#   check_cve_impact  ->  generate_requirements  ->  [Approval]  ->  push_requirements
+#
+# Inputs  (artifacts from check_cve_impact via set_stats):
+#   vulnerable_sboms (or cve_impact_vulnerable)  list of {id, name, hits}
+#   cve_impact_cve, cve_impact_package
+#
+# What it does:
+#   1. Downloads each vulnerable SBOM JSON from RHTPA (saved on the bastion for review)
+#   2. Extracts Python packages (CycloneDX, SPDX, or the scanner report format)
+#   3. Looks up the latest version of each package on PyPI
+#   4. Builds requirements.txt content per SBOM and prints a review summary
+#
+# Outputs (set_stats, consumed by push_requirements after approval):
+#   requirements_bundle   list of {sbom_id, sbom_name, requirements_file, content}
+#
+# Credentials: the same Keycloak custom credential as the other RHTPA jobs + bastion machine credential.
+
+- name: Generate requirements proposal from vulnerable SBOMs
+  hosts: localhost
+  connection: local 
+  gather_facts: false
+
+  vars:
+    cve_id: "{{ cve_impact_cve | default('') }}"
+    target_pkg: "{{ cve_impact_package | default('') }}"
+    sbom_targets: "{{ vulnerable_sboms | default(cve_impact_vulnerable | default([])) }}"
+
+    proxy_url: ""
+    rhtpa_host: server-trusted-profile-analyzer.apps.hub.lab.com
+    keycloak_host: keycloak-keycloak.apps.hub.lab.com
+    realm: rhtpa
+    client_id: rhtpa-cli
+    keycloak_admin_user: admin
+    validate_certs: false
+    hide_secrets: true
+    sbom_download_path: "/api/v3/sbom/{id}/download"   # {id} is replaced with the SBOM id
+
+    review_dir: "/var/tmp/rhtpa-review"               # SBOM JSON + proposed files land in <dir>/<cve_id>/ on the bastion
+    pypi_json_base: "https://pypi.org/pypi"           # PyPI JSON API; Nexus/Artifactory PyPI proxies usually serve the same path
+
+    # all        = every Python package >= latest PyPI version (same behaviour as python_version.yaml)
+    # vulnerable = only the CVE package is raised to latest; others stay >= installed version
+    upgrade_scope: all
+
+    # Path of the requirements file in the git repo. With more than one vulnerable SBOM,
+    # include {sbom_name}, e.g. "apps/{sbom_name}/requirements.txt"
+    requirements_file_template: "requirements.txt"
+
+    # Fail this node when there is nothing to approve, so the workflow does not reach the Approval node
+    fail_when_nothing_to_do: true
+
+  environment: "{{ {'https_proxy': proxy_url, 'http_proxy': proxy_url} if proxy_url | length > 0 else {} }}"
+
+  tasks:
+    # ---------- 0. Inputs ----------
+    - name: Stop if no vulnerable SBOMs were passed in
+      ansible.builtin.fail:
+        msg: "No vulnerable SBOMs received from the previous node - nothing to approve."
+      when:
+        - sbom_targets | length == 0
+        - fail_when_nothing_to_do | bool
+
+    - name: End quietly if no vulnerable SBOMs (fail_when_nothing_to_do=false)
+      ansible.builtin.meta: end_play
+      when: sbom_targets | length == 0
+
+    - name: Require {sbom_name} in the file path when several SBOMs are affected
+      ansible.builtin.assert:
+        that: sbom_targets | length == 1 or '{sbom_name}' in requirements_file_template
+        fail_msg: >-
+          {{ sbom_targets | length }} SBOMs are affected but requirements_file_template
+          ('{{ requirements_file_template }}') would write them all to the same file.
+          Set it to something like 'apps/{sbom_name}/requirements.txt'.
+
+    - name: Check that a secret was supplied
+      ansible.builtin.assert:
+        that: >-
+          (rhtpa_client_secret | default('') | length > 0) or
+          (keycloak_admin_password | default('') | length > 0)
+        fail_msg: "Neither rhtpa_client_secret nor keycloak_admin_password reached the playbook. Attach the Keycloak credential."
+        quiet: true
+
+    # ---------- 1. OIDC token ----------
+    - name: Look up client secret via Keycloak admin (only if not supplied)
+      when: rhtpa_client_secret | default('') | length == 0
+      no_log: "{{ hide_secrets }}"
+      block:
+        - name: Admin token (master realm)
+          ansible.builtin.uri:
+            url: "https://{{ keycloak_host }}/realms/master/protocol/openid-connect/token"
+            method: POST
+            body_format: form-urlencoded
+            body:
+              grant_type: password
+              client_id: admin-cli
+              username: "{{ keycloak_admin_user }}"
+              password: "{{ keycloak_admin_password }}"
+            validate_certs: "{{ validate_certs }}"
+          register: admin_tok
+
+        - name: Find client UUID
+          ansible.builtin.uri:
+            url: "https://{{ keycloak_host }}/admin/realms/{{ realm }}/clients?clientId={{ client_id }}"
+            headers: { Authorization: "Bearer {{ admin_tok.json.access_token }}" }
+            validate_certs: "{{ validate_certs }}"
+          register: client_lookup
+
+        - name: Read client secret
+          ansible.builtin.uri:
+            url: "https://{{ keycloak_host }}/admin/realms/{{ realm }}/clients/{{ client_lookup.json[0].id }}/client-secret"
+            headers: { Authorization: "Bearer {{ admin_tok.json.access_token }}" }
+            validate_certs: "{{ validate_certs }}"
+          register: secret_lookup
+
+        - name: Store client secret
+          ansible.builtin.set_fact:
+            rhtpa_client_secret: "{{ secret_lookup.json.value }}"
+
+    - name: Get RHTPA bearer token (client_credentials)
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_host }}/realms/{{ realm }}/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          grant_type: client_credentials
+          client_id: "{{ client_id }}"
+          client_secret: "{{ rhtpa_client_secret }}"
+        validate_certs: "{{ validate_certs }}"
+      register: rhtpa_tok
+      no_log: "{{ hide_secrets }}"
+
+    - name: Set auth header
+      ansible.builtin.set_fact:
+        rhtpa_headers:
+          Authorization: "Bearer {{ rhtpa_tok.json.access_token }}"
+      no_log: "{{ hide_secrets }}"
+
+    # ---------- 2. Download SBOM JSON ----------
+    - name: Create review directory on the bastion
+      ansible.builtin.file:
+        path: "{{ review_dir }}/{{ cve_id | default('no-cve', true) }}"
+        state: directory
+        mode: "0750"
+
+    - name: Download SBOM documents from RHTPA
+      ansible.builtin.uri:
+        url: "https://{{ rhtpa_host }}{{ sbom_download_path | replace('{id}', item.id | string | urlencode) }}"
+        headers: "{{ rhtpa_headers }}"
+        validate_certs: "{{ validate_certs }}"
+        return_content: true
+        status_code: [200]
+      loop: "{{ sbom_targets }}"
+      loop_control:
+        label: "{{ item.name | default(item.id) }}"
+      register: sbom_docs
+
+    - name: Save SBOM JSON on the bastion for the reviewer
+      ansible.builtin.copy:
+        content: "{{ item.content }}"
+        dest: "{{ review_dir }}/{{ cve_id | default('no-cve', true) }}/{{ item.item.name | default('sbom') | regex_replace('[^A-Za-z0-9._-]', '_') }}_{{ item.item.id | string | regex_replace('[^A-Za-z0-9._-]', '_') }}.json"
+        mode: "0640"
+      loop: "{{ sbom_docs.results }}"
+      loop_control:
+        label: "{{ item.item.name | default(item.item.id) }}"
+
+    # ---------- 3. Extract Python packages ----------
+    - name: Extract Python packages from each SBOM
+      ansible.builtin.set_fact:
+        sbom_pkgs_raw: >-
+          {%- set out = [] -%}
+          {%- for r in sbom_docs.results -%}
+            {%- set doc = r.json if (r.json is defined and r.json is mapping) else {} -%}
+            {%- set pk = [] -%}
+            {#- CycloneDX -#}
+            {%- for c in doc.components | default([]) -%}
+              {%- set purl = (c.purl | default('')) | string -%}
+              {%- if purl is match('pkg:pypi/') -%}
+                {%- set _ = pk.append({'name': (c.name | default('')) | string, 'version': (c.version | default('')) | string, 'purl': purl}) -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {#- SPDX -#}
+            {%- for p in doc.packages | default([]) -%}
+              {%- for ref in p.externalRefs | default([]) -%}
+                {%- set purl = (ref.referenceLocator | default('')) | string -%}
+                {%- if (ref.referenceType | default('')) == 'purl' and purl is match('pkg:pypi/') -%}
+                  {%- set _ = pk.append({'name': (p.name | default('')) | string, 'version': (p.versionInfo | default('')) | string, 'purl': purl}) -%}
+                {%- endif -%}
+              {%- endfor -%}
+            {%- endfor -%}
+            {#- Scanner report format used by python_version.yaml -#}
+            {%- for p in doc.input.image.sbom_info.packages | default([]) -%}
+              {%- if (p.system | default('')) == 'python' -%}
+                {%- set _ = pk.append({'name': (p.name | default('')) | string, 'version': (p.version | default('')) | string, 'purl': (p.purl | default('')) | string}) -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {#- Normalise names (PEP 503), fill gaps from purl, de-duplicate -#}
+            {%- set norm = [] -%}
+            {%- set seen = [] -%}
+            {%- for p in pk -%}
+              {%- set raw_name = p.name if p.name else (p.purl | regex_search('pkg:pypi/([^@?#]+)', '\\1') | default([''], true) | first) -%}
+              {%- set n = raw_name | lower | regex_replace('[-_.]+', '-') -%}
+              {%- set v = p.version if p.version else (p.purl | regex_search('@([^?#]+)', '\\1') | default([''], true) | first) -%}
+              {%- if n and n not in seen -%}
+                {%- set _ = seen.append(n) -%}
+                {%- set _ = norm.append({'name': n, 'version': v, 'purl': p.purl}) -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {%- set _ = out.append({'id': r.item.id, 'name': r.item.name | default('N/A'), 'packages': norm}) -%}
+          {%- endfor -%}
+          {{ out | to_json }}
+
+    - name: Normalise package list
+      ansible.builtin.set_fact:
+        sbom_pkgs: "{{ sbom_pkgs_raw | from_json if sbom_pkgs_raw is string else sbom_pkgs_raw }}"
+        target_norm: "{{ target_pkg | lower | regex_replace('[-_.]+', '-') }}"
+
+    - name: Collect unique package names across SBOMs
+      ansible.builtin.set_fact:
+        all_py_names: "{{ sbom_pkgs | map(attribute='packages') | flatten | map(attribute='name') | unique | sort }}"
+
+    - name: Warn if an SBOM has no Python packages
+      ansible.builtin.debug:
+        msg: "WARNING: no Python (pkg:pypi) packages found in SBOM {{ item.name }} ({{ item.id }})"
+      loop: "{{ sbom_pkgs }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: item.packages | length == 0
+
+    # ---------- 4. Latest versions from PyPI ----------
+    - name: Look up latest version on PyPI
+      ansible.builtin.uri:
+        url: "{{ pypi_json_base }}/{{ item }}/json"
+        validate_certs: "{{ validate_certs }}"
+        timeout: 20
+      loop: "{{ all_py_names }}"
+      register: pypi
+      failed_when: false
+      no_log: true                     # PyPI JSON is large; keeps AAP job events small
+
+    - name: Build latest-version map
+      ansible.builtin.set_fact:
+        latest_map_raw: >-
+          {%- set m = {} -%}
+          {%- for r in pypi.results | default([]) -%}
+            {%- set info = (r.json | default({})).info | default({}) if (r.status | default(0)) == 200 else {} -%}
+            {%- set _ = m.update({r.item: (info.version | default('')) | string}) -%}
+          {%- endfor -%}
+          {{ m | to_json }}
+
+    - name: Normalise latest-version map
+      ansible.builtin.set_fact:
+        latest_map: "{{ latest_map_raw | from_json if latest_map_raw is string else latest_map_raw }}"
+
+    # ---------- 5. Build requirements proposal ----------
+    - name: Build requirements content per SBOM
+      ansible.builtin.set_fact:
+        proposal_raw: >-
+          {%- set bundle = [] -%}
+          {%- set review = [] -%}
+          {%- for s in sbom_pkgs -%}
+            {%- set lines = [] -%}
+            {%- set changes = [] -%}
+            {%- set unknown = [] -%}
+            {%- for p in s.packages -%}
+              {%- set latest = latest_map[p.name] | default('') -%}
+              {%- set is_target = (p.name == target_norm) -%}
+              {%- set bump = latest != '' and (upgrade_scope == 'all' or is_target) -%}
+              {%- set req = latest if bump else p.version -%}
+              {%- set _ = lines.append(p.name ~ ('>=' ~ req if req else '')) -%}
+              {%- if latest == '' -%}{%- set _ = unknown.append(p.name) -%}{%- endif -%}
+              {%- if req and req != p.version -%}
+                {%- set _ = changes.append(p.name ~ ': ' ~ (p.version | default('?', true)) ~ ' -> >=' ~ req ~ ('   <== ' ~ cve_id if is_target else '')) -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {%- set file = requirements_file_template | replace('{sbom_name}', s.name | regex_replace('[^A-Za-z0-9._-]', '_')) -%}
+            {%- set content = (lines | sort | join('\n')) ~ '\n' -%}
+            {%- set _ = bundle.append({'sbom_id': s.id, 'sbom_name': s.name, 'requirements_file': file, 'content': content}) -%}
+            {%- set _ = review.append({'sbom_id': s.id, 'sbom_name': s.name, 'requirements_file': file,
+                  'package_count': s.packages | length, 'changes': changes, 'not_found_on_pypi': unknown,
+                  'cve_package_present': target_norm in (s.packages | map(attribute='name') | list),
+                  'lines': lines | sort}) -%}
+          {%- endfor -%}
+          {{ {'bundle': bundle, 'review': review} | to_json }}
+
+    - name: Normalise proposal
+      ansible.builtin.set_fact:
+        proposal: "{{ proposal_raw | from_json if proposal_raw is string else proposal_raw }}"
+
+    - name: Save proposed requirements files on the bastion
+      ansible.builtin.copy:
+        content: "{{ item.content }}"
+        dest: "{{ review_dir }}/{{ cve_id | default('no-cve', true) }}/{{ item.sbom_name | regex_replace('[^A-Za-z0-9._-]', '_') }}.requirements.txt"
+        mode: "0640"
+      loop: "{{ proposal.bundle }}"
+      loop_control:
+        label: "{{ item.sbom_name }}"
+
+    # ---------- 6. Review summary (what the approver reads) ----------
+    - name: "REVIEW - proposed changes per SBOM"
+      ansible.builtin.debug:
+        msg: >-
+          {{ [
+               'CVE            : ' ~ (cve_id | default('n/a', true)) ~ '   package: ' ~ (target_norm | default('n/a', true)),
+               'SBOM           : ' ~ item.sbom_name ~ ' (' ~ item.sbom_id ~ ')',
+               'Git file       : ' ~ item.requirements_file,
+               'Python packages: ' ~ item.package_count ~ '   upgrade scope: ' ~ upgrade_scope,
+               'CVE package in SBOM: ' ~ ('yes' if item.cve_package_present else 'NO - check SBOM'),
+               '--- version changes (' ~ (item.changes | length) ~ ') ---'
+             ] + item.changes
+             + ((['--- not found on PyPI, kept at installed version ---'] + item.not_found_on_pypi) if item.not_found_on_pypi | length > 0 else [])
+             + ['--- proposed ' ~ item.requirements_file ~ ' ---'] + item.lines }}
+      loop: "{{ proposal.review }}"
+      loop_control:
+        label: "{{ item.sbom_name }}"
+
+    - name: Stop if no SBOM has any version change
+      ansible.builtin.fail:
+        msg: "No requirement changes were produced for any SBOM - nothing to approve."
+      when:
+        - fail_when_nothing_to_do | bool
+        - proposal.review | map(attribute='changes') | flatten | length == 0
+
+    # ---------- 7. Hand over to Approval / push node ----------
+    - name: Publish proposal to downstream workflow nodes
+      ansible.builtin.set_stats:
+        data:
+          requirements_bundle: "{{ proposal.bundle }}"
+          requirements_review_dir: "{{ review_dir }}/{{ cve_id | default('no-cve', true) }}"
