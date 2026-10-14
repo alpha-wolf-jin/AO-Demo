@@ -1,17 +1,22 @@
 ---
 # AAP workflow node: build a requirements proposal for human approval (NO git push)
 #
-#   check_cve_impact  ->  generate_requirements  ->  [Approval]  ->  push_requirements
+#   cve_triage -> check_cve_impact  ->  generate_requirements  ->  [Approval]  ->  push_requirements
 #
-# Inputs  (artifacts from check_cve_impact via set_stats):
-#   vulnerable_sboms (or cve_impact_vulnerable)  list of {id, name, hits}
-#   cve_impact_cve, cve_impact_package
+# Inputs  (workflow artifacts via set_stats):
+#   vulnerable_sboms (or cve_impact_vulnerable)  list of {id, name, hits}      <- check_cve_impact
+#   cve_impact_cve, cve_impact_package                                         <- check_cve_impact
+#   cve_impact_fixed_versions, cve_impact_vulnerable_ranges                    <- check_cve_impact
+#   cve_record (optional)                                                       <- triage node
+#     used as fallback for CVE id / package / fixed version, and for the approver's CVE summary
 #
 # What it does:
 #   1. Downloads each vulnerable SBOM JSON from RHTPA (saved on the bastion for review)
 #   2. Extracts Python packages (CycloneDX, SPDX, or the scanner report format)
 #   3. Looks up the latest version of each package on PyPI
-#   4. Builds requirements.txt content per SBOM and prints a review summary
+#   4. Builds requirements.txt content per SBOM; the CVE package is never below the fixed version
+#   5. Checks the proposed CVE-package version is outside the vulnerable range
+#   6. Prints a review summary for the approver
 #
 # Outputs (set_stats, consumed by push_requirements after approval):
 #   requirements_bundle   list of {sbom_id, sbom_name, requirements_file, content}
@@ -23,8 +28,7 @@
   gather_facts: false
 
   vars:
-    cve_id: "{{ cve_impact_cve | default('') }}"
-    target_pkg: "{{ cve_impact_package | default('') }}"
+    cve_record: {}
     sbom_targets: "{{ vulnerable_sboms | default(cve_impact_vulnerable | default([])) }}"
 
     proxy_url: ""
@@ -39,10 +43,16 @@
 
     review_dir: "/var/tmp/rhtpa-review"               # SBOM JSON + proposed files land in <dir>/<cve_id>/ on the bastion
     pypi_json_base: "https://pypi.org/pypi"           # PyPI JSON API; Nexus/Artifactory PyPI proxies usually serve the same path
+    version_compare_type: loose                       # 'pep440' if the packaging lib is in the EE
 
     # all        = every Python package >= latest PyPI version (same behaviour as python_version.yaml)
-    # vulnerable = only the CVE package is raised to latest; others stay >= installed version
+    # vulnerable = only the CVE package is raised (to latest, never below the fix); others stay >= installed
     upgrade_scope: all
+
+    # Packages that are not app dependencies and are left out of requirements.txt
+    exclude_vendored: true                            # copies bundled inside another package (e.g. setuptools/_vendor/*)
+    vendored_path_regex: "/_vendor/"
+    exclude_packages: [pip, setuptools, wheel]        # install tooling; set [] to include them
 
     # Path of the requirements file in the git repo. With more than one vulnerable SBOM,
     # include {sbom_name}, e.g. "apps/{sbom_name}/requirements.txt"
@@ -50,11 +60,37 @@
 
     # Fail this node when there is nothing to approve, so the workflow does not reach the Approval node
     fail_when_nothing_to_do: true
+    # Fail this node when the proposal would NOT fix the CVE for some SBOM
+    fail_when_cve_not_fixed: true
 
   environment: "{{ {'https_proxy': proxy_url, 'http_proxy': proxy_url} if proxy_url | length > 0 else {} }}"
 
   tasks:
     # ---------- 0. Inputs ----------
+    - name: Resolve CVE inputs (check_cve_impact artifacts first, cve_record as fallback)
+      vars:
+        rec: >-
+          {{ (cve_record | from_json) if (cve_record is string and cve_record | trim | length > 0)
+             else (cve_record if cve_record is mapping else {}) }}
+        rec_pkg: >-
+          {{ rec.purls | default([]) | select('match', '^pkg:pypi/')
+             | map('regex_replace', '^pkg:pypi/', '') | map('regex_replace', '[@?#].*$', '')
+             | first | default('') }}
+        pkg: >-
+          {{ (cve_impact_package | default('') | default(rec_pkg, true))
+             | lower | regex_replace('[-_.]+', '-') }}
+        pkg_re: "{{ '^' ~ (pkg | regex_replace('-', '[-_.]')) ~ '@' }}"
+        rec_fixed: >-
+          {{ rec.remediation.fixed_versions | default([])
+             | select('search', pkg_re, ignorecase=true) | map('regex_replace', '^.*@', '') | list
+             if pkg | length > 0 else [] }}
+      ansible.builtin.set_fact:
+        cve_rec: "{{ rec }}"
+        target_cve: "{{ cve_impact_cve | default('') | default(cve_id | default(''), true) | default(rec.cve_id | default(''), true) }}"
+        target_norm: "{{ pkg }}"
+        fixed_versions: "{{ cve_impact_fixed_versions | default([]) | default(rec_fixed, true) }}"
+        vuln_ranges: "{{ cve_impact_vulnerable_ranges | default([]) }}"
+
     - name: Stop if no vulnerable SBOMs were passed in
       ansible.builtin.fail:
         msg: "No vulnerable SBOMs received from the previous node - nothing to approve."
@@ -73,6 +109,14 @@
           {{ sbom_targets | length }} SBOMs are affected but requirements_file_template
           ('{{ requirements_file_template }}') would write them all to the same file.
           Set it to something like 'apps/{sbom_name}/requirements.txt'.
+
+    - name: Warn when CVE context is missing
+      ansible.builtin.debug:
+        msg:
+          - "WARNING: CVE id='{{ target_cve }}' package='{{ target_norm }}' fixed={{ fixed_versions }}"
+          - "Without the package and fixed version the proposal cannot guarantee the CVE is fixed."
+          - "Check that check_cve_impact (cve_impact_*) or the triage node (cve_record) publish them with set_stats."
+      when: target_cve | length == 0 or target_norm | length == 0 or fixed_versions | length == 0
 
     - name: Check that a secret was supplied
       ansible.builtin.assert:
@@ -140,7 +184,7 @@
     # ---------- 2. Download SBOM JSON ----------
     - name: Create review directory on the bastion
       ansible.builtin.file:
-        path: "{{ review_dir }}/{{ cve_id | default('no-cve', true) }}"
+        path: "{{ review_dir }}/{{ target_cve | default('no-cve', true) }}"
         state: directory
         mode: "0750"
 
@@ -159,7 +203,7 @@
     - name: Save SBOM JSON on the bastion for the reviewer
       ansible.builtin.copy:
         content: "{{ item.content }}"
-        dest: "{{ review_dir }}/{{ cve_id | default('no-cve', true) }}/{{ item.item.name | default('sbom') | regex_replace('[^A-Za-z0-9._-]', '_') }}_{{ item.item.id | string | regex_replace('[^A-Za-z0-9._-]', '_') }}.json"
+        dest: "{{ review_dir }}/{{ target_cve | default('no-cve', true) }}/{{ item.item.name | default('sbom') | regex_replace('[^A-Za-z0-9._-]', '_') }}_{{ item.item.id | string | regex_replace('[^A-Za-z0-9._-]', '_') }}.json"
         mode: "0640"
       loop: "{{ sbom_docs.results }}"
       loop_control:
@@ -183,7 +227,13 @@
             {%- for c in doc.components | default([]) -%}
               {%- set purl = (c.purl | default('')) | string -%}
               {%- if purl is match('pkg:pypi/') -%}
-                {%- set _ = pk.append({'name': (c.name | default('')) | string, 'version': (c.version | default('')) | string, 'purl': purl}) -%}
+                {#- syft records where each package was found; a copy bundled inside another package lives under /_vendor/ -#}
+                {%- set locs = c.properties | default([]) | selectattr('name', 'defined')
+                               | selectattr('name', 'match', 'syft:location:[0-9]+:path')
+                               | map(attribute='value') | list -%}
+                {%- set vendored = locs | length > 0 and (locs | reject('search', vendored_path_regex) | list | length == 0) -%}
+                {%- set _ = pk.append({'name': (c.name | default('')) | string, 'version': (c.version | default('')) | string,
+                                       'purl': purl, 'vendored': vendored}) -%}
               {%- endif -%}
             {%- endfor -%}
             {#- SPDX -#}
@@ -191,7 +241,11 @@
               {%- for ref in p.externalRefs | default([]) -%}
                 {%- set purl = (ref.referenceLocator | default('')) | string -%}
                 {%- if (ref.referenceType | default('')) == 'purl' and purl is match('pkg:pypi/') -%}
-                  {%- set _ = pk.append({'name': (p.name | default('')) | string, 'version': (p.versionInfo | default('')) | string, 'purl': purl}) -%}
+                  {#- syft puts the file paths it read in sourceInfo: "acquired package info from ...: /path/a, /path/b" -#}
+                  {%- set paths = ((p.sourceInfo | default('')) | string | regex_replace('^[^/]*', '')).split(', ') | select | list -%}
+                  {%- set vendored = paths | length > 0 and (paths | reject('search', vendored_path_regex) | list | length == 0) -%}
+                  {%- set _ = pk.append({'name': (p.name | default('')) | string, 'version': (p.versionInfo | default('')) | string,
+                                         'purl': purl, 'vendored': vendored}) -%}
                 {%- endif -%}
               {%- endfor -%}
             {%- endfor -%}
@@ -201,26 +255,32 @@
                 {%- set _ = pk.append({'name': (p.name | default('')) | string, 'version': (p.version | default('')) | string, 'purl': (p.purl | default('')) | string}) -%}
               {%- endif -%}
             {%- endfor -%}
-            {#- Normalise names (PEP 503), fill gaps from purl, de-duplicate -#}
+            {#- Normalise names (PEP 503), fill gaps from purl, drop vendored/tooling, de-duplicate -#}
             {%- set norm = [] -%}
             {%- set seen = [] -%}
-            {%- for p in pk -%}
+            {%- set skipped = [] -%}
+            {%- set excl = exclude_packages | map('lower') | map('regex_replace', '[-_.]+', '-') | list -%}
+            {#- real installs first, so a vendored copy never wins the de-duplication -#}
+            {%- for p in (pk | rejectattr('vendored', 'defined') | list) + (pk | selectattr('vendored', 'defined') | sort(attribute='vendored') | list) -%}
               {%- set raw_name = p.name if p.name else (p.purl | regex_search('pkg:pypi/([^@?#]+)', '\\1') | default([''], true) | first) -%}
               {%- set n = raw_name | lower | regex_replace('[-_.]+', '-') -%}
               {%- set v = p.version if p.version else (p.purl | regex_search('@([^?#]+)', '\\1') | default([''], true) | first) -%}
-              {%- if n and n not in seen -%}
+              {%- if n and p.vendored | default(false) and exclude_vendored | bool -%}
+                {%- set _ = skipped.append(n ~ '==' ~ v ~ ' (bundled inside another package)') -%}
+              {%- elif n and n in excl -%}
+                {%- if n not in seen -%}{%- set _ = skipped.append(n ~ '==' ~ v ~ ' (install tooling)') -%}{%- set _ = seen.append(n) -%}{%- endif -%}
+              {%- elif n and n not in seen -%}
                 {%- set _ = seen.append(n) -%}
                 {%- set _ = norm.append({'name': n, 'version': v, 'purl': p.purl}) -%}
               {%- endif -%}
             {%- endfor -%}
-            {%- set _ = out.append({'id': r.item.id, 'name': r.item.name | default('N/A'), 'packages': norm}) -%}
+            {%- set _ = out.append({'id': r.item.id, 'name': r.item.name | default('N/A'), 'packages': norm | sort(attribute='name'), 'skipped': skipped}) -%}
           {%- endfor -%}
           {{ out | to_json }}
 
     - name: Normalise package list
       ansible.builtin.set_fact:
         sbom_pkgs: "{{ sbom_pkgs_raw | from_json if sbom_pkgs_raw is string else sbom_pkgs_raw }}"
-        target_norm: "{{ target_pkg | lower | regex_replace('[-_.]+', '-') }}"
 
     - name: Collect unique package names across SBOMs
       ansible.builtin.set_fact:
@@ -259,9 +319,7 @@
       loop: "{{ all_py_names }}"
       register: pypi
       failed_when: false
-      no_log: true                     # PyPI JSON is large; keeps AAP job events small
-
-    - debug: var=pypi
+      no_log: true                     # PyPI JSON is large; keeps AAP job events small - do not debug this var
 
     - name: Build latest-version map
       ansible.builtin.set_fact:
@@ -273,13 +331,9 @@
           {%- endfor -%}
           {{ m | to_json }}
 
-    - debug: var=latest_map_raw
-
     - name: Normalise latest-version map
       ansible.builtin.set_fact:
         latest_map: "{{ latest_map_raw | from_json if latest_map_raw is string else latest_map_raw }}"
-
-    - debug: var=latest_map
 
     # ---------- 5. Build requirements proposal ----------
     - name: Build requirements content per SBOM
@@ -291,15 +345,53 @@
             {%- set lines = [] -%}
             {%- set changes = [] -%}
             {%- set unknown = [] -%}
+            {%- set cve = namespace(present=false, installed='', fixed='', proposed='', check='n/a') -%}
             {%- for p in s.packages -%}
               {%- set latest = latest_map[p.name] | default('') -%}
               {%- set is_target = (p.name == target_norm) -%}
-              {%- set bump = latest != '' and (upgrade_scope == 'all' or is_target) -%}
-              {%- set req = latest if bump else p.version -%}
+              {%- if is_target -%}
+                {#- fixed version for this SBOM: lowest fix >= installed (handles multiple fix branches), else highest fix -#}
+                {%- set fx = namespace(best='', top='') -%}
+                {%- for f in fixed_versions -%}
+                  {%- if fx.top == '' or f is version(fx.top, '>', version_type=version_compare_type) -%}{%- set fx.top = f -%}{%- endif -%}
+                  {%- if (p.version == '' or f is version(p.version, '>', version_type=version_compare_type))
+                        and (fx.best == '' or f is version(fx.best, '<', version_type=version_compare_type)) -%}
+                    {%- set fx.best = f -%}
+                  {%- endif -%}
+                {%- endfor -%}
+                {%- set fixed = fx.best | default(fx.top, true) -%}
+                {%- if latest and fixed -%}
+                  {%- set req = latest if latest is version(fixed, '>=', version_type=version_compare_type) else fixed -%}
+                {%- else -%}
+                  {%- set req = latest | default(fixed, true) | default(p.version, true) -%}
+                {%- endif -%}
+                {#- fix check: the minimum allowed version must not be in any vulnerable range -#}
+                {%- set chk = namespace(state='UNKNOWN') -%}
+                {%- if req and vuln_ranges | length > 0 -%}
+                  {%- set chk.state = 'PASS' -%}
+                  {%- for rng in vuln_ranges -%}
+                    {%- set inner = namespace(ok=true) -%}
+                    {%- for c in rng -%}
+                      {%- if not (req is version(c.ver, c.op, version_type=version_compare_type)) -%}{%- set inner.ok = false -%}{%- endif -%}
+                    {%- endfor -%}
+                    {%- if inner.ok -%}{%- set chk.state = 'FAIL' -%}{%- endif -%}
+                  {%- endfor -%}
+                {%- elif req and fixed -%}
+                  {%- set chk.state = 'PASS' if req is version(fixed, '>=', version_type=version_compare_type) else 'FAIL' -%}
+                {%- endif -%}
+                {%- set cve.present = true -%}
+                {%- set cve.installed = p.version -%}
+                {%- set cve.fixed = fixed -%}
+                {%- set cve.proposed = req -%}
+                {%- set cve.check = chk.state -%}
+              {%- else -%}
+                {%- set req = latest if (latest != '' and upgrade_scope == 'all') else p.version -%}
+              {%- endif -%}
               {%- set _ = lines.append(p.name ~ ('>=' ~ req if req else '')) -%}
               {%- if latest == '' -%}{%- set _ = unknown.append(p.name) -%}{%- endif -%}
               {%- if req and req != p.version -%}
-                {%- set _ = changes.append(p.name ~ ': ' ~ (p.version | default('?', true)) ~ ' -> >=' ~ req ~ ('   <== ' ~ cve_id if is_target else '')) -%}
+                {%- set _ = changes.append(p.name ~ ': ' ~ (p.version | default('?', true)) ~ ' -> >=' ~ req
+                      ~ (('   <== ' ~ target_cve ~ ' (fixed in ' ~ (cve.fixed | default('?', true)) ~ ')') if is_target else '')) -%}
               {%- endif -%}
             {%- endfor -%}
             {%- set file = requirements_file_template | replace('{sbom_name}', s.name | regex_replace('[^A-Za-z0-9._-]', '_')) -%}
@@ -307,11 +399,11 @@
             {%- set _ = bundle.append({'sbom_id': s.id, 'sbom_name': s.name, 'requirements_file': file, 'content': content}) -%}
             {%- set _ = review.append({'sbom_id': s.id, 'sbom_name': s.name, 'requirements_file': file,
                   'package_count': s.packages | length, 'changes': changes, 'not_found_on_pypi': unknown,
-                  'cve_package_present': target_norm in (s.packages | map(attribute='name') | list),
-                  'lines': lines | sort}) -%}
+                  'cve_package_present': cve.present, 'cve_installed': cve.installed, 'cve_fixed': cve.fixed,
+                  'cve_proposed': cve.proposed, 'cve_fix_check': cve.check if cve.present else 'NOT IN SBOM',
+                  'skipped': s.skipped | default([]), 'lines': lines | sort}) -%}
           {%- endfor -%}
           {{ {'bundle': bundle, 'review': review} | to_json }}
-
 
     - name: Normalise proposal
       ansible.builtin.set_fact:
@@ -320,29 +412,55 @@
     - name: Save proposed requirements files on the bastion
       ansible.builtin.copy:
         content: "{{ item.content }}"
-        dest: "{{ review_dir }}/{{ cve_id | default('no-cve', true) }}/{{ item.sbom_name | regex_replace('[^A-Za-z0-9._-]', '_') }}.requirements.txt"
+        dest: "{{ review_dir }}/{{ target_cve | default('no-cve', true) }}/{{ item.sbom_name | regex_replace('[^A-Za-z0-9._-]', '_') }}.requirements.txt"
         mode: "0640"
       loop: "{{ proposal.bundle }}"
       loop_control:
         label: "{{ item.sbom_name }}"
 
     # ---------- 6. Review summary (what the approver reads) ----------
+    - name: "REVIEW - CVE summary"
+      vars:
+        r: "{{ cve_rec }}"
+        ex: "{{ r.exploitation | default({}) }}"
+      ansible.builtin.debug:
+        msg:
+          - "CVE            : {{ target_cve | default('n/a', true) }}"
+          - "Title          : {{ r.title | default('n/a') }}"
+          - "Severity       : {{ r.severity | default('n/a') }}   CVSS {{ r.cvss_score | default('n/a') }} ({{ r.cvss_score_source | default('n/a') }})"
+          - "Exploitation   : KEV={{ ex.kev | default('n/a') }}   EPSS={{ ex.epss | default('n/a') }} (percentile {{ ex.epss_percentile | default('n/a') }})   SSVC={{ ex.ssvc_exploitation | default('n/a') }}"
+          - "Package        : {{ target_norm | default('n/a', true) }}"
+          - "Vulnerable if  : {% for rng in vuln_ranges %}{{ ' OR ' if not loop.first }}({% for c in rng %}{{ ', ' if not loop.first }}{{ c.op }} {{ c.ver }}{% endfor %}){% else %}{{ r.remediation.vulnerable_ranges | default(['n/a']) | join(' | ') }}{% endfor %}"
+          - "Fixed in       : {{ fixed_versions | join(', ') | default('unknown', true) }}"
+          - "Mitigation     : {{ (r.vendor_notes.red_hat_mitigation | default('') | default('n/a', true)) | truncate(300) }}"
+
     - name: "REVIEW - proposed changes per SBOM"
       ansible.builtin.debug:
         msg: >-
           {{ [
-               'CVE            : ' ~ (cve_id | default('n/a', true)) ~ '   package: ' ~ (target_norm | default('n/a', true)),
                'SBOM           : ' ~ item.sbom_name ~ ' (' ~ item.sbom_id ~ ')',
                'Git file       : ' ~ item.requirements_file,
                'Python packages: ' ~ item.package_count ~ '   upgrade scope: ' ~ upgrade_scope,
-               'CVE package in SBOM: ' ~ ('yes' if item.cve_package_present else 'NO - check SBOM'),
+               'CVE fix check  : ' ~ item.cve_fix_check
+                 ~ ((' - ' ~ target_norm ~ ' ' ~ (item.cve_installed | default('?', true)) ~ ' -> >=' ~ item.cve_proposed
+                     ~ ' (fixed in ' ~ (item.cve_fixed | default('?', true)) ~ ')') if item.cve_package_present else ''),
                '--- version changes (' ~ (item.changes | length) ~ ') ---'
              ] + item.changes
              + ((['--- not found on PyPI, kept at installed version ---'] + item.not_found_on_pypi) if item.not_found_on_pypi | length > 0 else [])
+             + ((['--- left out of requirements (' ~ (item.skipped | length) ~ ') ---'] + item.skipped) if item.skipped | length > 0 else [])
              + ['--- proposed ' ~ item.requirements_file ~ ' ---'] + item.lines }}
       loop: "{{ proposal.review }}"
       loop_control:
         label: "{{ item.sbom_name }}"
+
+    - name: Stop if the proposal would not fix the CVE
+      ansible.builtin.fail:
+        msg: >-
+          The proposed requirements do not fix {{ target_cve }} for:
+          {{ proposal.review | selectattr('cve_fix_check', 'equalto', 'FAIL') | map(attribute='sbom_name') | join(', ') }}
+      when:
+        - fail_when_cve_not_fixed | bool
+        - proposal.review | selectattr('cve_fix_check', 'equalto', 'FAIL') | list | length > 0
 
     - name: Stop if no SBOM has any version change
       ansible.builtin.fail:
@@ -356,4 +474,4 @@
       ansible.builtin.set_stats:
         data:
           requirements_bundle: "{{ proposal.bundle }}"
-          requirements_review_dir: "{{ review_dir }}/{{ cve_id | default('no-cve', true) }}"
+          requirements_review_dir: "{{ review_dir }}/{{ target_cve | default('no-cve', true) }}"
