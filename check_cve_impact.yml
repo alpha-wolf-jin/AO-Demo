@@ -297,12 +297,6 @@
           cve_impact_vulnerable: "{{ vulnerable_sboms }}"
           cve_impact_sbom_files: "{{ sbom_downloads.results | default([]) | map(attribute='path') | list }}"
 
-
-    - name: Publish record to downstream workflow nodes (AAP)
-      ansible.builtin.set_stats:
-        data:
-          cve_record: "{{ cve_record }}"
-
     #- name: Fail job when vulnerable SBOMs found
     #  ansible.builtin.fail:
     #    msg: "{{ vulnerable_sboms | length }} SBOM(s) contain a vulnerable {{ pkg_name }} for {{ cve_id }}"
