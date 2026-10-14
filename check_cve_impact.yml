@@ -44,8 +44,7 @@
     hide_secrets: true
     fail_on_affected: true
     # RHTPA list APIs are paginated; without a limit only the first page is returned
-    sbom_page_limit: 1000              # max SBOMs fetched from /api/v3/sbom
-    package_page_limit: 10000          # max packages fetched per SBOM from /api/v3/sbom/{id}/packages
+    page_size: 100                     # items per request; all pages are fetched, so this only affects request count
 
     # Download vulnerable SBOMs to the bastion
     download_sboms: true
@@ -285,36 +284,95 @@
           - "Matching basis   : {{ match_basis }}"
 
     # ---------- 3. Audit stored SBOMs ----------
-    - name: List stored SBOMs
+    - name: List stored SBOMs (first page)
       ansible.builtin.uri:
-        url: "https://{{ rhtpa_host }}/api/v3/sbom?offset=0&limit={{ sbom_page_limit }}"
+        url: "https://{{ rhtpa_host }}/api/v3/sbom?offset=0&limit={{ page_size }}"
         headers: "{{ rhtpa_headers }}"
         validate_certs: "{{ validate_certs }}"
         return_content: true
       register: sbom_list
 
+    - name: List stored SBOMs (remaining pages)
+      ansible.builtin.uri:
+        url: "https://{{ rhtpa_host }}/api/v3/sbom?offset={{ item }}&limit={{ page_size }}"
+        headers: "{{ rhtpa_headers }}"
+        validate_certs: "{{ validate_certs }}"
+        return_content: true
+      loop: "{{ range(page_size | int, sbom_list.json.total | default(0) | int, page_size | int) | list }}"
+      register: sbom_list_more
+
     - name: Extract SBOM list
       ansible.builtin.set_fact:
-        sboms: "{{ sbom_list.json['items'] | default([]) }}"
+        sboms: >-
+          {{ (sbom_list.json['items'] | default([]))
+             + (sbom_list_more.results | default([]) | map(attribute='json', default={})
+                | map(attribute='items', default=[]) | flatten) }}
 
-    - name: Warn if the SBOM list was cut off by paging
+    - name: Warn if the SBOM list is incomplete
       ansible.builtin.debug:
-        msg: >-
-          WARNING: RHTPA reports {{ sbom_list.json.total }} SBOMs but only {{ sboms | length }} were returned.
-          Raise sbom_page_limit - SBOMs beyond the limit are NOT audited.
+        msg: "WARNING: RHTPA reports {{ sbom_list.json.total }} SBOMs but {{ sboms | length }} were retrieved."
       when: (sbom_list.json.total | default(0) | int) > (sboms | length)
 
-    - name: Get packages for each SBOM
+    - name: Get packages for each SBOM (first page)
       ansible.builtin.uri:
-        url: "https://{{ rhtpa_host }}/api/v3/sbom/{{ item.id | string | urlencode }}/packages?offset=0&limit={{ package_page_limit }}"
+        url: "https://{{ rhtpa_host }}/api/v3/sbom/{{ item.id | string | urlencode }}/packages?offset=0&limit={{ page_size }}"
         headers: "{{ rhtpa_headers }}"
         validate_certs: "{{ validate_certs }}"
         return_content: true
       loop: "{{ sboms }}"
       loop_control:
         label: "{{ item.name | default(item.id) }}"
-      register: pkg_results
-      no_log: true                     # package lists are large; counts are shown in the next task
+      register: pkg_first
+      failed_when: false               # errors are reported clearly in the next task
+      no_log: true                     # package lists are large
+
+    - name: Fail with the RHTPA error if a package request failed
+      ansible.builtin.fail:
+        msg: >-
+          {{ pkg_first.results | rejectattr('status', 'equalto', 200)
+             | map(attribute='item.name') | zip(
+                 pkg_first.results | rejectattr('status', 'equalto', 200) | map(attribute='status'),
+                 pkg_first.results | rejectattr('status', 'equalto', 200) | map(attribute='msg', default=''),
+                 pkg_first.results | rejectattr('status', 'equalto', 200)
+                   | map(attribute='content', default='') | map('truncate', 300))
+             | map('join', ' | ') | list }}
+      when: pkg_first.results | rejectattr('status', 'equalto', 200) | list | length > 0
+
+    - name: Work out the remaining package pages
+      ansible.builtin.set_fact:
+        pkg_pages: >-
+          {%- set out = [] -%}
+          {%- for r in pkg_first.results -%}
+            {%- for off in range(page_size | int, (r.json.total | default(0) | int), page_size | int) -%}
+              {%- set _ = out.append({'sbom': r.item, 'offset': off}) -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Get packages for each SBOM (remaining pages)
+      ansible.builtin.uri:
+        url: "https://{{ rhtpa_host }}/api/v3/sbom/{{ item.sbom.id | string | urlencode }}/packages?offset={{ item.offset }}&limit={{ page_size }}"
+        headers: "{{ rhtpa_headers }}"
+        validate_certs: "{{ validate_certs }}"
+        return_content: true
+      loop: "{{ pkg_pages }}"
+      loop_control:
+        label: "{{ item.sbom.name | default(item.sbom.id) }} @ {{ item.offset }}"
+      register: pkg_more
+      no_log: true
+
+    - name: Merge package pages per SBOM
+      ansible.builtin.set_fact:
+        pkg_results: >-
+          {%- set res = [] -%}
+          {%- for r in pkg_first.results -%}
+            {%- set extra = pkg_more.results | default([]) | selectattr('item.sbom.id', 'equalto', r.item.id)
+                            | map(attribute='json', default={}) | map(attribute='items', default=[]) | flatten -%}
+            {%- set _ = res.append({'item': r.item, 'status': r.status,
+                  'json': {'items': (r.json['items'] | default([])) + extra, 'total': r.json.total | default(none)}}) -%}
+          {%- endfor -%}
+          {{ {'results': res} }}
+      no_log: true
 
     - name: Summarise packages fetched per SBOM
       ansible.builtin.set_fact:
@@ -336,7 +394,7 @@
           {%- set lines = [] -%}
           {%- for e in pkg_fetch_report -%}
             {%- set _ = lines.append(e.name ~ ': ' ~ e.got ~ ' of ' ~ e.total
-                  ~ ('   <== CUT OFF, raise package_page_limit' if e.cut else '')
+                  ~ ('   <== INCOMPLETE' if e.cut else '')
                   ~ ('   <== HTTP ' ~ e.status if e.status != 200 else '')) -%}
           {%- endfor -%}
           {{ lines }}
@@ -345,7 +403,7 @@
       ansible.builtin.fail:
         msg: >-
           Package lists were incomplete for: {{ pkg_fetch_report | selectattr('cut') | map(attribute='name') | join(', ') }}.
-          Raise package_page_limit and rerun - otherwise affected SBOMs can be missed.
+          Rerun; if it persists, check RHTPA - otherwise affected SBOMs can be missed.
       when: pkg_fetch_report | selectattr('cut') | list | length > 0
 
     - name: Match target package in each SBOM
