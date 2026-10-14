@@ -560,10 +560,10 @@
             {%- if i.not_found_on_pypi | length > 0 -%}
               {%- set _ = L.append('    Not found on PyPI (kept at installed version): ' ~ (i.not_found_on_pypi | join(', '))) -%}
             {%- endif -%}
-            {%- if i.skipped | default([]) | length > 0 -%}
-              {%- set _ = L.append('    Left out (' ~ (i.skipped | length) ~ '): '
-                    ~ (i.skipped | map('regex_replace', ' \(.*$', '') | join(', '))) -%}
-            {%- endif -%}
+            #{%- if i.skipped | default([]) | length > 0 -%}
+            #  {%- set _ = L.append('    Left out (' ~ (i.skipped | length) ~ '): '
+            #        ~ (i.skipped | map('regex_replace', ' \(.*$', '') | join(', '))) -%}
+            #{%- endif -%}
           {%- endfor -%}
           {{ L | join(nl) }}
         requirements_content: >-
