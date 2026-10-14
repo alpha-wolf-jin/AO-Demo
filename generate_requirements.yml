@@ -19,13 +19,14 @@
 #   6. Prints a review summary for the approver
 #
 # Outputs (set_stats, consumed by push_requirements after approval):
-#   requirements_bundle   list of {sbom_id, sbom_name, requirements_file, content}
+#   requirements_bundle    list of {sbom_id, sbom_name, requirements_file, content}  (used by push_requirements)
+#   requirements_approval  one text message for the approver: CVE summary + changes per SBOM
+#   requirements_content   the proposed requirements file content (one file, or all files with headers)
 #
 # Credentials: the same Keycloak custom credential as the other RHTPA jobs + bastion machine credential.
 
 - name: Generate requirements proposal from vulnerable SBOMs
-  hosts: localhost
-  connection: local
+  hosts: all
   gather_facts: false
 
   vars:
@@ -450,7 +451,6 @@
       ansible.builtin.set_fact:
         proposal: "{{ proposal_raw | from_json if proposal_raw is string else proposal_raw }}"
 
-
     - name: Save proposed requirements files on the bastion
       ansible.builtin.copy:
         content: "{{ item.content }}"
@@ -495,21 +495,69 @@
       loop_control:
         label: "{{ item.sbom_name }}"
 
-    - name: "Proposed changes per SBOM"
-      ansible.builtin.set_facts:
-        msg_approval: >-
-          {{ [
-               'SBOM           : ' ~ item.sbom_name ~ ' (' ~ item.sbom_id ~ ')',
-               'CVE fix check  : ' ~ item.cve_fix_check
-                 ~ ((' - ' ~ target_norm ~ ' ' ~ (item.cve_installed | default('?', true)) ~ ' -> >=' ~ item.cve_proposed
-                     ~ ' (fixed in ' ~ (item.cve_fixed | default('?', true)) ~ ')') if item.cve_package_present else ''),
-               '--- version changes (' ~ (item.changes | length) ~ ') ---'
-             ] + item.changes }}
-      loop: "{{ proposal.review }}"
-      loop_control:
-        label: "{{ item.sbom_name }}"
+    # ---------- 6b. Messages for downstream nodes (approval / notification / push) ----------
+    # Built in ONE task across all SBOMs (no loop), so nothing is overwritten.
+    - name: Build approval message and requirements content message
+      vars:
+        nl: "\n"                      # a real newline (YAML double-quoted escape)
+        r: "{{ cve_rec }}"
+        ranges_text: >-
+          {%- set t = [] -%}
+          {%- for rng in vuln_ranges -%}
+            {%- set _ = t.append('(' ~ (rng | map(attribute='op') | zip(rng | map(attribute='ver')) | map('join', ' ') | join(', ')) ~ ')') -%}
+          {%- endfor -%}
+          {{ t | join(' OR ') if t else (r.remediation.vulnerable_ranges | default(['unknown']) | join(' | ')) }}
+      ansible.builtin.set_fact:
+        requirements_approval: >-
+          {%- set L = [] -%}
+          {%- set rv = proposal.review -%}
+          {%- set _ = L.append('CVE APPROVAL REQUEST: ' ~ (target_cve | default('n/a', true)) ~ ' in ' ~ (target_norm | default('n/a', true))) -%}
+          {%- set _ = L.append('Severity: ' ~ (r.severity | default('n/a')) ~ ' (CVSS ' ~ (r.cvss_score | default('n/a')) ~ ')'
+                ~ ' | KEV: ' ~ (r.exploitation.kev | default('n/a')) ~ ' | EPSS: ' ~ (r.exploitation.epss | default('n/a'))) -%}
+          {%- set _ = L.append('Vulnerable if: ' ~ ranges_text ~ ' | Fixed in: ' ~ (fixed_versions | join(', ') | default('unknown', true))) -%}
+          {%- set _ = L.append('SBOMs: ' ~ (rv | length)
+                ~ ' | Fix check PASS: ' ~ (rv | selectattr('cve_fix_check', 'equalto', 'PASS') | list | length)
+                ~ ', FAIL: ' ~ (rv | selectattr('cve_fix_check', 'equalto', 'FAIL') | list | length)
+                ~ ', other: ' ~ (rv | rejectattr('cve_fix_check', 'in', ['PASS', 'FAIL']) | list | length)
+                ~ ' | Version changes: ' ~ (rv | map(attribute='changes') | flatten | length)
+                ~ ' | Upgrade scope: ' ~ upgrade_scope) -%}
+          {%- for i in rv -%}
+            {%- set _ = L.append('') -%}
+            {%- set _ = L.append('[' ~ loop.index ~ '] ' ~ i.sbom_name ~ ' (' ~ i.sbom_id ~ ')') -%}
+            {%- set _ = L.append('    File      : ' ~ i.requirements_file) -%}
+            {%- set _ = L.append('    Fix check : ' ~ i.cve_fix_check
+                  ~ ((' - ' ~ target_norm ~ ' ' ~ (i.cve_installed | default('?', true)) ~ ' -> >=' ~ i.cve_proposed
+                      ~ ' (fixed in ' ~ (i.cve_fixed | default('?', true)) ~ ')') if i.cve_package_present else '')) -%}
+            {%- set _ = L.append('    Changes (' ~ (i.changes | length) ~ '):') -%}
+            {%- for c in i.changes -%}{%- set _ = L.append('      * ' ~ c) -%}{%- endfor -%}
+            {%- if i.not_found_on_pypi | length > 0 -%}
+              {%- set _ = L.append('    Not found on PyPI (kept at installed version): ' ~ (i.not_found_on_pypi | join(', '))) -%}
+            {%- endif -%}
+            {%- if i.skipped | default([]) | length > 0 -%}
+              {%- set _ = L.append('    Left out (' ~ (i.skipped | length) ~ '): '
+                    ~ (i.skipped | map('regex_replace', ' \(.*$', '') | join(', '))) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ L | join(nl) }}
+        requirements_content: >-
+          {%- set L = [] -%}
+          {%- if proposal.bundle | length == 1 -%}
+            {%- set _ = L.append(proposal.bundle[0].content | trim) -%}
+          {%- else -%}
+            {%- for b in proposal.bundle -%}
+              {%- set _ = L.append(('' if loop.first else nl) ~ '# ===== ' ~ b.requirements_file ~ '  (SBOM: ' ~ b.sbom_name ~ ') =====') -%}
+              {%- set _ = L.append(b.content | trim) -%}
+            {%- endfor -%}
+          {%- endif -%}
+          {{ L | join(nl) }}
 
-    - debug: var=msg_approval
+    - name: "APPROVAL MESSAGE (published as requirements_approval)"
+      ansible.builtin.debug:
+        msg: "{{ requirements_approval.splitlines() }}"
+
+    - name: "REQUIREMENTS CONTENT (published as requirements_content)"
+      ansible.builtin.debug:
+        msg: "{{ requirements_content.splitlines() }}"
 
     - name: Stop if the proposal would not fix the CVE
       ansible.builtin.fail:
@@ -533,4 +581,5 @@
         data:
           requirements_bundle: "{{ proposal.bundle }}"
           requirements_review_dir: "{{ review_dir }}/{{ target_cve | default('no-cve', true) }}"
-          requirements_approval: "{{ msg_approval }}"
+          requirements_approval: "{{ requirements_approval }}"
+          requirements_content: "{{ requirements_content }}"
