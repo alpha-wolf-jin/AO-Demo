@@ -449,6 +449,8 @@
       ansible.builtin.set_fact:
         proposal: "{{ proposal_raw | from_json if proposal_raw is string else proposal_raw }}"
 
+    - debug: var=proposal
+
     - name: Save proposed requirements files on the bastion
       ansible.builtin.copy:
         content: "{{ item.content }}"
