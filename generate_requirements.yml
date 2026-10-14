@@ -19,8 +19,7 @@
 # Credentials: the same Keycloak custom credential as the other RHTPA jobs + bastion machine credential.
 
 - name: Generate requirements proposal from vulnerable SBOMs
-  hosts: localhost
-  connection: local 
+  hosts: all
   gather_facts: false
 
   vars:
@@ -172,7 +171,13 @@
         sbom_pkgs_raw: >-
           {%- set out = [] -%}
           {%- for r in sbom_docs.results -%}
-            {%- set doc = r.json if (r.json is defined and r.json is mapping) else {} -%}
+            {%- if r.json is defined and r.json is mapping -%}
+              {%- set doc = r.json -%}
+            {%- elif (r.content | default('') | trim)[:1] == '{' -%}
+              {%- set doc = r.content | from_json -%}
+            {%- else -%}
+              {%- set doc = {} -%}
+            {%- endif -%}
             {%- set pk = [] -%}
             {#- CycloneDX -#}
             {%- for c in doc.components | default([]) -%}
@@ -221,9 +226,25 @@
       ansible.builtin.set_fact:
         all_py_names: "{{ sbom_pkgs | map(attribute='packages') | flatten | map(attribute='name') | unique | sort }}"
 
-    - name: Warn if an SBOM has no Python packages
+    - name: Diagnose SBOMs with no Python packages
+      vars:
+        r: "{{ sbom_docs.results | selectattr('item.id', 'equalto', item.id) | first }}"
+        body: "{{ r.content | default('') | string }}"
+        doc: >-
+          {{ r.json if (r.json is defined and r.json is mapping)
+             else ((body | trim | from_json) if (body | trim)[:1] == '{' else {}) }}
       ansible.builtin.debug:
-        msg: "WARNING: no Python (pkg:pypi) packages found in SBOM {{ item.name }} ({{ item.id }})"
+        msg:
+          - "WARNING: no Python (pkg:pypi) packages found in SBOM {{ item.name }} ({{ item.id }})"
+          - "HTTP status    : {{ r.status | default('n/a') }}   content-type: {{ r.content_type | default('n/a') }}   bytes: {{ body | length }}"
+          - "Parsed as JSON : {{ 'yes' if doc | length > 0 else 'NO - body is not JSON (compressed, XML or an error page?)' }}"
+          - "Format         : {{ 'CycloneDX ' ~ doc.specVersion | default('') if doc.bomFormat is defined else ('SPDX ' ~ doc.spdxVersion | default('') if doc.spdxVersion is defined else 'unknown') }}"
+          - "Top-level keys : {{ doc.keys() | list | join(', ') if doc is mapping else '' }}"
+          - "Components/packages in SBOM: {{ (doc.components | default([]) | length) + (doc.packages | default([]) | length) }}"
+          - "Sample purls   : {{ (((doc.components | default([]) | map(attribute='purl', default='') | list)
+                                 + (doc.packages | default([]) | map(attribute='externalRefs', default=[]) | flatten
+                                    | map(attribute='referenceLocator', default='') | list)) | select | list)[:5] }}"
+          - "Body starts    : {{ body[:200] }}"
       loop: "{{ sbom_pkgs }}"
       loop_control:
         label: "{{ item.name }}"
