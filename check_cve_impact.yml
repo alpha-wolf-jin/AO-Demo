@@ -279,11 +279,14 @@
         #  ansible.builtin.debug:
         #    msg: "{{ sbom_downloads.results | map(attribute='path') | list }}"
 
+        - name: Show Affected SBOM UUID 
+          ansible.builtin.debug:
+            var: vulnerable_sboms
 
         - name: Publish record to downstream workflow nodes (AAP)
           ansible.builtin.set_stats:
             data:
-              vulnerable_sboms_list: "{{ vulnerable_sboms }}"
+              vulnerable_sboms: "{{ vulnerable_sboms }}"
 
     - name: Publish results for workflow
       ansible.builtin.set_stats:
