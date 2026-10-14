@@ -24,7 +24,8 @@
 # Credentials: the same Keycloak custom credential as the other RHTPA jobs + bastion machine credential.
 
 - name: Generate requirements proposal from vulnerable SBOMs
-  hosts: all
+  hosts: localhost
+  connection: local
   gather_facts: false
 
   vars:
