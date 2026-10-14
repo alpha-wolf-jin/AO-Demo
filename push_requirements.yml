@@ -28,7 +28,7 @@
 
     #git_repo_url: ""
     #git_branch: ""                     # empty = repository default branch
-    #github_api: "https://api.github.com"   # GitHub Enterprise: https://<host>/api/v3
+    github_api: "https://api.github.com"   # GitHub Enterprise: https://<host>/api/v3
     #git_user: "{{ lookup('env', 'GIT_USER') | default('alpha-wolf-jin', true) }}"
     #git_token: "{{ lookup('env', 'GIT_TOKEN') }}"
     validate_certs: false
