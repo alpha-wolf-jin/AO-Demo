@@ -10,7 +10,7 @@
 #   keycloak_admin_password  # only needed if rhtpa_client_secret is not supplied
 
 - name: Seed CVE advisory into RHTPA
-  hosts: bastion
+  hosts: all
   gather_facts: false
 
   vars:
