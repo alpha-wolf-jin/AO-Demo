@@ -200,9 +200,41 @@
         label: "{{ item.name | default(item.id) }}"
       register: sbom_docs
 
+    # Some RHTPA storage backends (S3-compatible object stores) keep the AWS "aws-chunked" upload
+    # framing inside the stored object:  "<hex size>;chunk-signature=<sig>\r\n<data>\r\n ... 0;chunk-signature=<sig>\r\n\r\n"
+    # Strip it so the SBOM is valid JSON again. Bodies without framing pass through unchanged.
+    - name: Clean SBOM bodies (strip S3 aws-chunked framing)
+      ansible.builtin.set_fact:
+        sbom_bodies: >-
+          {%- set m = {} -%}
+          {%- for r in sbom_docs.results -%}
+            {%- if r.json is defined and r.json is mapping -%}
+              {%- set body = r.json | to_json -%}
+            {%- else -%}
+              {%- set body = (r.content | default('') | string)
+                   | regex_replace('(\r\n)?[0-9a-fA-F]+;chunk-signature=[0-9a-fA-F]+(\r\n)+', '') -%}
+            {%- endif -%}
+            {%- set _ = m.update({r.item.id | string: body}) -%}
+          {%- endfor -%}
+          {{ m }}
+        sbom_framed: >-
+          {%- set f = [] -%}
+          {%- for r in sbom_docs.results -%}
+            {%- if not (r.json is defined and r.json is mapping) and ';chunk-signature=' in (r.content | default('') | string) -%}
+              {%- set _ = f.append(r.item.name | default(r.item.id)) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ f }}
+      no_log: true                     # bodies are large; keep job events small
+
+    - name: Report SBOMs that had storage framing removed
+      ansible.builtin.debug:
+        msg: "NOTE: S3 aws-chunked framing was stripped from: {{ sbom_framed | join(', ') }}"
+      when: sbom_framed | length > 0
+
     - name: Save SBOM JSON on the bastion for the reviewer
       ansible.builtin.copy:
-        content: "{{ item.content }}"
+        content: "{{ sbom_bodies[item.item.id | string] }}"
         dest: "{{ review_dir }}/{{ target_cve | default('no-cve', true) }}/{{ item.item.name | default('sbom') | regex_replace('[^A-Za-z0-9._-]', '_') }}_{{ item.item.id | string | regex_replace('[^A-Za-z0-9._-]', '_') }}.json"
         mode: "0640"
       loop: "{{ sbom_docs.results }}"
@@ -215,10 +247,11 @@
         sbom_pkgs_raw: >-
           {%- set out = [] -%}
           {%- for r in sbom_docs.results -%}
+            {%- set clean = sbom_bodies[r.item.id | string] | default('') | trim -%}
             {%- if r.json is defined and r.json is mapping -%}
               {%- set doc = r.json -%}
-            {%- elif (r.content | default('') | trim)[:1] == '{' -%}
-              {%- set doc = r.content | from_json -%}
+            {%- elif clean[:1] == '{' -%}
+              {%- set doc = clean | from_json -%}
             {%- else -%}
               {%- set doc = {} -%}
             {%- endif -%}
@@ -289,7 +322,7 @@
     - name: Diagnose SBOMs with no Python packages
       vars:
         r: "{{ sbom_docs.results | selectattr('item.id', 'equalto', item.id) | first }}"
-        body: "{{ r.content | default('') | string }}"
+        body: "{{ sbom_bodies[item.id | string] | default('') | string }}"
         doc: >-
           {{ r.json if (r.json is defined and r.json is mapping)
              else ((body | trim | from_json) if (body | trim)[:1] == '{' else {}) }}
