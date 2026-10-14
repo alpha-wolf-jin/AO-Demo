@@ -256,28 +256,34 @@
         - download_sboms | bool
         - vulnerable_sboms | length > 0
       block:
-        - name: Create download directory
-          ansible.builtin.file:
-            path: "{{ sbom_download_dir }}/{{ cve_id }}"
-            state: directory
-            mode: "0750"
+        #- name: Create download directory
+        #  ansible.builtin.file:
+        #    path: "{{ sbom_download_dir }}/{{ cve_id }}"
+        #    state: directory
+        #    mode: "0750"
 
-        - name: Download SBOM documents
-          ansible.builtin.uri:
-            url: "https://{{ rhtpa_host }}{{ sbom_download_path | replace('{id}', item.id | string | urlencode) }}"
-            headers: "{{ rhtpa_headers }}"
-            validate_certs: "{{ validate_certs }}"
-            dest: "{{ sbom_download_dir }}/{{ cve_id }}/{{ item.name | regex_replace('[^A-Za-z0-9._-]', '_') }}_{{ item.id | string | regex_replace('[^A-Za-z0-9._-]', '_') }}.json"
-            mode: "0640"
-            status_code: [200]
-          loop: "{{ vulnerable_sboms }}"
-          loop_control:
-            label: "{{ item.name }}"
-          register: sbom_downloads
+        #- name: Download SBOM documents
+        #  ansible.builtin.uri:
+        #    url: "https://{{ rhtpa_host }}{{ sbom_download_path | replace('{id}', item.id | string | urlencode) }}"
+        #    headers: "{{ rhtpa_headers }}"
+        #    validate_certs: "{{ validate_certs }}"
+        #    dest: "{{ sbom_download_dir }}/{{ cve_id }}/{{ item.name | regex_replace('[^A-Za-z0-9._-]', '_') }}_{{ item.id | string | regex_replace('[^A-Za-z0-9._-]', '_') }}.json"
+        #    mode: "0640"
+        #    status_code: [200]
+        #  loop: "{{ vulnerable_sboms }}"
+        #  loop_control:
+        #    label: "{{ item.name }}"
+        #  register: sbom_downloads
 
-        - name: Show downloaded files
-          ansible.builtin.debug:
-            msg: "{{ sbom_downloads.results | map(attribute='path') | list }}"
+        #- name: Show downloaded files
+        #  ansible.builtin.debug:
+        #    msg: "{{ sbom_downloads.results | map(attribute='path') | list }}"
+
+
+        - name: Publish record to downstream workflow nodes (AAP)
+          ansible.builtin.set_stats:
+            data:
+              vulnerable_sboms_list: "{{ vulnerable_sboms }}"
 
     - name: Publish results for workflow
       ansible.builtin.set_stats:
@@ -288,9 +294,15 @@
           cve_impact_vulnerable: "{{ vulnerable_sboms }}"
           cve_impact_sbom_files: "{{ sbom_downloads.results | default([]) | map(attribute='path') | list }}"
 
-    - name: Fail job when vulnerable SBOMs found
-      ansible.builtin.fail:
-        msg: "{{ vulnerable_sboms | length }} SBOM(s) contain a vulnerable {{ pkg_name }} for {{ cve_id }}"
-      when:
-        - fail_on_affected | bool
-        - vulnerable_sboms | length > 0
+
+    - name: Publish record to downstream workflow nodes (AAP)
+      ansible.builtin.set_stats:
+        data:
+          cve_record: "{{ cve_record }}"
+
+    #- name: Fail job when vulnerable SBOMs found
+    #  ansible.builtin.fail:
+    #    msg: "{{ vulnerable_sboms | length }} SBOM(s) contain a vulnerable {{ pkg_name }} for {{ cve_id }}"
+    #  when:
+    #    - fail_on_affected | bool
+    #    - vulnerable_sboms | length > 0
