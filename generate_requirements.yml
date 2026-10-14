@@ -211,8 +211,15 @@
             {%- if r.json is defined and r.json is mapping -%}
               {%- set body = r.json | to_json -%}
             {%- else -%}
-              {%- set body = (r.content | default('') | string)
-                   | regex_replace('(\r\n)?[0-9a-fA-F]+;chunk-signature=[0-9a-fA-F]+(\r\n)+', '') -%}
+              {%- set body = r.content | default('') | string -%}
+              {%- if ';chunk-signature=' in body -%}
+                {#- 1. chunk headers  2. checksum trailer (x-amz-checksum-*, x-amz-trailer-signature)
+                    3. safety net: drop anything left after the closing brace of the JSON document -#}
+                {%- set body = body
+                     | regex_replace('(\r\n)?[0-9a-fA-F]+;chunk-signature=[0-9a-fA-F]+(\r\n)+', '')
+                     | regex_replace('(\r\n)*x-amz-[A-Za-z0-9-]+:[^\r\n]*', '')
+                     | regex_replace('\}[^}]*$', '}') -%}
+              {%- endif -%}
             {%- endif -%}
             {%- set _ = m.update({r.item.id | string: body}) -%}
           {%- endfor -%}
