@@ -43,7 +43,9 @@
     validate_certs: false
     hide_secrets: true
     fail_on_affected: true
-    sbom_list_query: ""                # e.g. "?limit=1000" if your RHTPA paginates the SBOM list
+    # RHTPA list APIs are paginated; without a limit only the first page is returned
+    sbom_page_limit: 1000              # max SBOMs fetched from /api/v3/sbom
+    package_page_limit: 10000          # max packages fetched per SBOM from /api/v3/sbom/{id}/packages
 
     # Download vulnerable SBOMs to the bastion
     download_sboms: true
@@ -285,7 +287,7 @@
     # ---------- 3. Audit stored SBOMs ----------
     - name: List stored SBOMs
       ansible.builtin.uri:
-        url: "https://{{ rhtpa_host }}/api/v3/sbom{{ sbom_list_query }}"
+        url: "https://{{ rhtpa_host }}/api/v3/sbom?offset=0&limit={{ sbom_page_limit }}"
         headers: "{{ rhtpa_headers }}"
         validate_certs: "{{ validate_certs }}"
         return_content: true
@@ -295,9 +297,16 @@
       ansible.builtin.set_fact:
         sboms: "{{ sbom_list.json['items'] | default([]) }}"
 
+    - name: Warn if the SBOM list was cut off by paging
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: RHTPA reports {{ sbom_list.json.total }} SBOMs but only {{ sboms | length }} were returned.
+          Raise sbom_page_limit - SBOMs beyond the limit are NOT audited.
+      when: (sbom_list.json.total | default(0) | int) > (sboms | length)
+
     - name: Get packages for each SBOM
       ansible.builtin.uri:
-        url: "https://{{ rhtpa_host }}/api/v3/sbom/{{ item.id }}/packages"
+        url: "https://{{ rhtpa_host }}/api/v3/sbom/{{ item.id | string | urlencode }}/packages?offset=0&limit={{ package_page_limit }}"
         headers: "{{ rhtpa_headers }}"
         validate_certs: "{{ validate_certs }}"
         return_content: true
@@ -305,6 +314,39 @@
       loop_control:
         label: "{{ item.name | default(item.id) }}"
       register: pkg_results
+      no_log: true                     # package lists are large; counts are shown in the next task
+
+    - name: Summarise packages fetched per SBOM
+      ansible.builtin.set_fact:
+        pkg_fetch_report: >-
+          {%- set out = [] -%}
+          {%- for r in pkg_results.results | default([]) -%}
+            {%- set body = r.json | default({}) -%}
+            {%- set got = (body['items'] | default([]) | length) if body is mapping else (body | length) -%}
+            {%- set total = (body.total | default(got)) if body is mapping else got -%}
+            {%- set _ = out.append({'name': r.item.name | default(r.item.id) | string, 'got': got | int,
+                                    'total': total | int, 'cut': (total | int) > (got | int),
+                                    'status': r.status | default(200)}) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Packages fetched per SBOM
+      ansible.builtin.debug:
+        msg: >-
+          {%- set lines = [] -%}
+          {%- for e in pkg_fetch_report -%}
+            {%- set _ = lines.append(e.name ~ ': ' ~ e.got ~ ' of ' ~ e.total
+                  ~ ('   <== CUT OFF, raise package_page_limit' if e.cut else '')
+                  ~ ('   <== HTTP ' ~ e.status if e.status != 200 else '')) -%}
+          {%- endfor -%}
+          {{ lines }}
+
+    - name: Fail if any SBOM package list was cut off by paging
+      ansible.builtin.fail:
+        msg: >-
+          Package lists were incomplete for: {{ pkg_fetch_report | selectattr('cut') | map(attribute='name') | join(', ') }}.
+          Raise package_page_limit and rerun - otherwise affected SBOMs can be missed.
+      when: pkg_fetch_report | selectattr('cut') | list | length > 0
 
     - name: Match target package in each SBOM
       ansible.builtin.set_fact:
