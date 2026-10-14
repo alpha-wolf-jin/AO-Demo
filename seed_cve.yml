@@ -1,0 +1,231 @@
+---
+# RHTPA - Proxy-aware CVE auto-resolution & ingestion (native Ansible port of seed_cve_only.sh)
+#
+# Run:
+#   ansible-playbook -i inventory seed_cve.yml -e cve_id=CVE-2023-45803 --ask-vault-pass
+#   (optional) -e proxy_url=http://proxy.lab.com:3128
+#
+# Secrets (put in a vault file / AAP credential, never in plain vars):
+#   rhtpa_client_secret      # preferred: secret of the rhtpa-cli client
+#   keycloak_admin_password  # only needed if rhtpa_client_secret is not supplied
+
+- name: Seed CVE advisory into RHTPA
+  hosts: bastion
+  gather_facts: false
+
+  vars:
+    cve_id: ""                         # required, pass with -e
+    proxy_url: ""                      # empty = use bastion env / direct
+    rhtpa_host: server-trusted-profile-analyzer.apps.hub.lab.com
+    keycloak_host: keycloak-keycloak.apps.hub.lab.com
+    realm: rhtpa
+    client_id: rhtpa-cli
+    keycloak_admin_user: admin
+    validate_certs: false              # mirrors curl -k; set true once CA is trusted
+    org_id: a39b4221-92f3-4e0d-b18a-350257e8006e
+
+    # Offline / air-gapped fallback
+    fallback_registry:
+      CVE-2020-28493: { name: jinja2,  version: "2.10",   ecosystem: pypi }
+      CVE-2019-11324: { name: urllib3, version: "1.24.1", ecosystem: pypi }
+      CVE-2024-23334: { name: aiohttp, version: "3.9.1",  ecosystem: pypi }
+      CVE-2023-45803: { name: urllib3, version: "2.0.6",  ecosystem: pypi }
+
+  environment: "{{ {'https_proxy': proxy_url, 'http_proxy': proxy_url} if proxy_url | length > 0 else {} }}"
+
+  tasks:
+    - name: Validate input
+      ansible.builtin.assert:
+        that: cve_id is match('^CVE-\d{4}-\d{4,}$')
+        fail_msg: "cve_id required, e.g. -e cve_id=CVE-2023-45803"
+
+    - name: Freeze run id and timestamp
+      ansible.builtin.set_fact:
+        run_id: "{{ now(utc=true, fmt='%s') }}"
+        run_ts: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+
+    # ---------- 1. Resolve package metadata ----------
+    - name: Query OSV for {{ cve_id }}
+      ansible.builtin.uri:
+        url: "https://api.osv.dev/v1/vulns/{{ cve_id }}"
+        validate_certs: "{{ validate_certs }}"
+        return_content: true
+        timeout: 20
+      register: osv
+      failed_when: false
+
+    - name: Parse OSV response
+      vars:
+        aff: "{{ (osv.json.affected | default([]) | first) if (osv.status | default(0)) == 200 else {} }}"
+        rng: "{{ aff.ranges | default([{}]) | first }}"
+        cpe: "{{ rng.database_specific.cpe | default('') }}"
+        intro: "{{ (rng.events | default([{}]) | first).introduced | default('') }}"
+      ansible.builtin.set_fact:
+        osv_name: >-
+          {{ aff.package.name
+             | default((cpe.split(':')[4]) if cpe | length > 0 else '', true)
+             | default((rng.repo | default('')).split('/') | last, true) }}
+        osv_ecosystem: "{{ aff.package.ecosystem | default('') | lower }}"
+        osv_version: >-
+          {{ (aff.versions | default([]) | first)
+             | default(intro if intro not in ['', '0'] else '', true) }}
+
+    - name: Merge OSV result with fallback registry
+      vars:
+        fb: "{{ fallback_registry[cve_id] | default({}) }}"
+      ansible.builtin.set_fact:
+        pkg_name: "{{ osv_name | trim | default(fb.name | default(''), true) }}"
+        pkg_version: "{{ osv_version | trim | default(fb.version | default(''), true) }}"
+        pkg_ecosystem: "{{ osv_ecosystem | default(fb.ecosystem | default('pypi'), true) }}"
+
+    - name: Fail if package could not be resolved
+      ansible.builtin.assert:
+        that:
+          - pkg_name | length > 0
+          - pkg_version | length > 0
+        fail_msg: "Could not resolve {{ cve_id }} from OSV or fallback registry (name='{{ pkg_name }}', version='{{ pkg_version }}')"
+
+    - name: Build PURL
+      ansible.builtin.set_fact:
+        pkg_purl: "pkg:{{ pkg_ecosystem }}/{{ pkg_name }}@{{ pkg_version }}"
+
+    - name: Show resolved metadata
+      ansible.builtin.debug:
+        msg:
+          - "Source    : {{ 'OSV' if osv_name | trim | length > 0 else 'fallback registry' }}"
+          - "Package   : {{ pkg_name }}"
+          - "Version   : {{ pkg_version }}"
+          - "Ecosystem : {{ pkg_ecosystem }}"
+          - "PURL      : {{ pkg_purl }}"
+
+    # ---------- 2. OIDC token ----------
+    - name: Look up client secret via Keycloak admin (only if not supplied)
+      when: rhtpa_client_secret is not defined
+      no_log: true
+      block:
+        - name: Admin token (master realm)
+          ansible.builtin.uri:
+            url: "https://{{ keycloak_host }}/realms/master/protocol/openid-connect/token"
+            method: POST
+            body_format: form-urlencoded
+            body:
+              grant_type: password
+              client_id: admin-cli
+              username: "{{ keycloak_admin_user }}"
+              password: "{{ keycloak_admin_password }}"
+            validate_certs: "{{ validate_certs }}"
+          register: admin_tok
+
+        - name: Find client UUID
+          ansible.builtin.uri:
+            url: "https://{{ keycloak_host }}/admin/realms/{{ realm }}/clients?clientId={{ client_id }}"
+            headers: { Authorization: "Bearer {{ admin_tok.json.access_token }}" }
+            validate_certs: "{{ validate_certs }}"
+          register: client_lookup
+
+        - name: Read client secret
+          ansible.builtin.uri:
+            url: "https://{{ keycloak_host }}/admin/realms/{{ realm }}/clients/{{ client_lookup.json[0].id }}/client-secret"
+            headers: { Authorization: "Bearer {{ admin_tok.json.access_token }}" }
+            validate_certs: "{{ validate_certs }}"
+          register: secret_lookup
+
+        - name: Store client secret
+          ansible.builtin.set_fact:
+            rhtpa_client_secret: "{{ secret_lookup.json.value }}"
+
+    - name: Get RHTPA bearer token (client_credentials)
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_host }}/realms/{{ realm }}/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          grant_type: client_credentials
+          client_id: "{{ client_id }}"
+          client_secret: "{{ rhtpa_client_secret }}"
+        validate_certs: "{{ validate_certs }}"
+      register: rhtpa_tok
+      no_log: true
+
+    - name: Set auth header
+      ansible.builtin.set_fact:
+        rhtpa_headers:
+          Authorization: "Bearer {{ rhtpa_tok.json.access_token }}"
+      no_log: true
+
+    # ---------- 3. CVE v5 record ----------
+    - name: Upload CVE v5 record
+      ansible.builtin.uri:
+        url: "https://{{ rhtpa_host }}/api/v3/advisory"
+        method: POST
+        headers: "{{ rhtpa_headers }}"
+        body_format: json
+        body:
+          dataType: CVE_RECORD
+          dataVersion: "5.1"
+          cveMetadata:
+            cveId: "{{ cve_id }}"
+            assignerOrgId: "{{ org_id }}"
+            state: PUBLISHED
+          containers:
+            cna:
+              providerMetadata: { orgId: "{{ org_id }}" }
+              title: "Security vulnerability {{ cve_id }} in {{ pkg_name }}"
+              descriptions:
+                - { lang: en, value: "{{ pkg_name }} {{ pkg_version }} vulnerable to {{ cve_id }}" }
+              affected:
+                - vendor: "{{ pkg_name }}"
+                  product: "{{ pkg_name }}"
+                  versions: [{ version: "{{ pkg_version }}", status: affected }]
+        status_code: [200, 201, 202]
+        validate_certs: "{{ validate_certs }}"
+        return_content: true
+      register: cve_upload
+
+    # ---------- 4. CSAF 2.0 VEX ----------
+    - name: Upload CSAF 2.0 VEX advisory
+      vars:
+        adv_id: "RHSA-{{ cve_id }}-{{ run_id }}"
+        prod_id: "CSAFPID-{{ cve_id }}-{{ run_id }}"
+      ansible.builtin.uri:
+        url: "https://{{ rhtpa_host }}/api/v3/advisory"
+        method: POST
+        headers: "{{ rhtpa_headers }}"
+        body_format: json
+        body:
+          document:
+            category: csaf_vex
+            csaf_version: "2.0"
+            publisher: { category: vendor, name: Red Hat Security, namespace: "https://access.redhat.com" }
+            title: "{{ adv_id }} - {{ pkg_name }} {{ pkg_version }} Advisory"
+            tracking:
+              id: "{{ adv_id }}"
+              status: final
+              version: "1"
+              initial_release_date: "{{ run_ts }}"
+              current_release_date: "{{ run_ts }}"
+              revision_history:
+                - { date: "{{ run_ts }}", number: "1", summary: Initial }
+          product_tree:
+            full_product_names:
+              - product_id: "{{ prod_id }}"
+                name: "{{ pkg_name }} {{ pkg_version }}"
+                product_identification_helper: { purl: "{{ pkg_purl }}" }
+          vulnerabilities:
+            - cve: "{{ cve_id }}"
+              title: "{{ pkg_name }} {{ pkg_version }} {{ cve_id }} Advisory"
+              notes:
+                - { category: description, text: "{{ pkg_name }} {{ pkg_version }} vulnerable to {{ cve_id }}" }
+              product_status:
+                known_affected: ["{{ prod_id }}"]
+        status_code: [200, 201, 202]
+        validate_certs: "{{ validate_certs }}"
+        return_content: true
+      register: csaf_upload
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "Ingestion complete for {{ cve_id }} -> {{ pkg_purl }}"
+          - "CVE record : HTTP {{ cve_upload.status }} {{ cve_upload.json | default(cve_upload.content | default('')) }}"
+          - "CSAF VEX   : HTTP {{ csaf_upload.status }} {{ csaf_upload.json | default(csaf_upload.content | default('')) }}"
