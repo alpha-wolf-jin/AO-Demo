@@ -56,9 +56,13 @@
     vendored_path_regex: "/_vendor/"
     exclude_packages: [pip, setuptools, wheel]        # install tooling; set [] to include them
 
-    # Path of the requirements file in the git repo. With more than one vulnerable SBOM,
-    # include {sbom_name}, e.g. "apps/{sbom_name}/requirements.txt"
+    # Path of the requirements file in the git repo.
+    #   requirements_file_template : used when ONE SBOM is affected (or always, if it contains {sbom_name})
+    #   multi_sbom_file_template   : used automatically when SEVERAL SBOMs are affected and the template
+    #                                above has no {sbom_name}, so each SBOM gets its own file
+    # {sbom_name} = SBOM name with unsafe characters replaced by "_" and leading dots removed
     requirements_file_template: "requirements.txt"
+    multi_sbom_file_template: "apps/{sbom_name}/requirements.txt"
 
     # Fail this node when there is nothing to approve, so the workflow does not reach the Approval node
     fail_when_nothing_to_do: true
@@ -112,13 +116,27 @@
       ansible.builtin.meta: end_play
       when: sbom_targets | length == 0
 
+    - name: Choose the requirements file path template
+      ansible.builtin.set_fact:
+        effective_file_template: >-
+          {{ requirements_file_template
+             if (sbom_targets | length == 1 or '{sbom_name}' in requirements_file_template)
+             else multi_sbom_file_template }}
+
+    - name: Note the per-SBOM file path
+      ansible.builtin.debug:
+        msg: >-
+          {{ sbom_targets | length }} SBOMs are affected, so each gets its own file:
+          '{{ effective_file_template }}' (requirements_file_template '{{ requirements_file_template }}' has no {sbom_name}).
+      when: effective_file_template != requirements_file_template
+
     - name: Require {sbom_name} in the file path when several SBOMs are affected
       ansible.builtin.assert:
-        that: sbom_targets | length == 1 or '{sbom_name}' in requirements_file_template
+        that: sbom_targets | length == 1 or '{sbom_name}' in effective_file_template
         fail_msg: >-
-          {{ sbom_targets | length }} SBOMs are affected but requirements_file_template
-          ('{{ requirements_file_template }}') would write them all to the same file.
-          Set it to something like 'apps/{sbom_name}/requirements.txt'.
+          {{ sbom_targets | length }} SBOMs are affected but the file path template
+          ('{{ effective_file_template }}') has no {sbom_name}, so they would all be written to the same file.
+          Set multi_sbom_file_template to something like 'apps/{sbom_name}/requirements.txt'.
 
     - name: Warn when CVE context is missing
       ansible.builtin.debug:
@@ -444,7 +462,8 @@
                       ~ (('   <== ' ~ target_cve ~ ' (fixed in ' ~ (cve.fixed | default('?', true)) ~ ')') if is_target else '')) -%}
               {%- endif -%}
             {%- endfor -%}
-            {%- set file = requirements_file_template | replace('{sbom_name}', s.name | regex_replace('[^A-Za-z0-9._-]', '_')) -%}
+            {%- set safe_name = s.name | regex_replace('[^A-Za-z0-9._-]', '_') | regex_replace('^[._]+', '') | default('sbom', true) -%}
+            {%- set file = effective_file_template | replace('{sbom_name}', safe_name) -%}
             {%- set content = (lines | sort | join('\n')) ~ '\n' -%}
             {%- set _ = bundle.append({'sbom_id': s.id, 'sbom_name': s.name, 'requirements_file': file, 'content': content}) -%}
             {%- set _ = review.append({'sbom_id': s.id, 'sbom_name': s.name, 'requirements_file': file,
