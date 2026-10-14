@@ -93,6 +93,14 @@
         fixed_versions: "{{ cve_impact_fixed_versions | default([]) | default(rec_fixed, true) }}"
         vuln_ranges: "{{ cve_impact_vulnerable_ranges | default([]) }}"
 
+    - name: Show SBOMs received from the previous node
+      ansible.builtin.debug:
+        msg:
+          - "Host running this play : {{ inventory_hostname }}  (hosts in play: {{ ansible_play_hosts_all | length }})"
+          - "vulnerable_sboms       : {{ (vulnerable_sboms | default([]) | length) if vulnerable_sboms is defined else 'not set' }}"
+          - "cve_impact_vulnerable  : {{ (cve_impact_vulnerable | default([]) | length) if cve_impact_vulnerable is defined else 'not set' }}"
+          - "Using {{ sbom_targets | length }} SBOM(s): {{ sbom_targets | map(attribute='name', default='?') | zip(sbom_targets | map(attribute='id', default='?')) | map('join', ' / ') | list }}"
+
     - name: Stop if no vulnerable SBOMs were passed in
       ansible.builtin.fail:
         msg: "No vulnerable SBOMs received from the previous node - nothing to approve."
