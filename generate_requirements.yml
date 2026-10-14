@@ -261,6 +261,8 @@
       failed_when: false
       no_log: true                     # PyPI JSON is large; keeps AAP job events small
 
+    - debug: var=pypi
+
     - name: Build latest-version map
       ansible.builtin.set_fact:
         latest_map_raw: >-
@@ -271,9 +273,13 @@
           {%- endfor -%}
           {{ m | to_json }}
 
+    - debug: var=latest_map_raw
+
     - name: Normalise latest-version map
       ansible.builtin.set_fact:
         latest_map: "{{ latest_map_raw | from_json if latest_map_raw is string else latest_map_raw }}"
+
+    - debug: var=latest_map
 
     # ---------- 5. Build requirements proposal ----------
     - name: Build requirements content per SBOM
@@ -305,6 +311,7 @@
                   'lines': lines | sort}) -%}
           {%- endfor -%}
           {{ {'bundle': bundle, 'review': review} | to_json }}
+
 
     - name: Normalise proposal
       ansible.builtin.set_fact:
