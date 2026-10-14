@@ -450,7 +450,6 @@
       ansible.builtin.set_fact:
         proposal: "{{ proposal_raw | from_json if proposal_raw is string else proposal_raw }}"
 
-    - debug: var=proposal
 
     - name: Save proposed requirements files on the bastion
       ansible.builtin.copy:
@@ -496,6 +495,22 @@
       loop_control:
         label: "{{ item.sbom_name }}"
 
+    - name: "Proposed changes per SBOM"
+      ansible.builtin.set_facts:
+        msg_approval: >-
+          {{ [
+               'SBOM           : ' ~ item.sbom_name ~ ' (' ~ item.sbom_id ~ ')',
+               'CVE fix check  : ' ~ item.cve_fix_check
+                 ~ ((' - ' ~ target_norm ~ ' ' ~ (item.cve_installed | default('?', true)) ~ ' -> >=' ~ item.cve_proposed
+                     ~ ' (fixed in ' ~ (item.cve_fixed | default('?', true)) ~ ')') if item.cve_package_present else ''),
+               '--- version changes (' ~ (item.changes | length) ~ ') ---'
+             ] + item.changes }}
+      loop: "{{ proposal.review }}"
+      loop_control:
+        label: "{{ item.sbom_name }}"
+
+    - debug: var=msg_approval
+
     - name: Stop if the proposal would not fix the CVE
       ansible.builtin.fail:
         msg: >-
@@ -518,3 +533,4 @@
         data:
           requirements_bundle: "{{ proposal.bundle }}"
           requirements_review_dir: "{{ review_dir }}/{{ target_cve | default('no-cve', true) }}"
+          requirements_approval: "{{ msg_approval }}"
