@@ -4,7 +4,8 @@
 #   check_cve_impact  ->  generate_requirements  ->  [Approval]  ->  push_requirements
 #
 # Input (artifact from generate_requirements via set_stats):
-#   requirements_bundle   list of {sbom_id, sbom_name, requirements_file, content}
+#   requirements_bundle    list of {sbom_id, sbom_name, requirements_file, content}
+#   requirements_approval  (optional) the approval message; added to the commit body as an audit trail
 #   The content is written exactly as the approver reviewed it - nothing is regenerated here.
 #
 # Credential: custom "Git push token" credential that injects env GIT_USER and GIT_TOKEN.
@@ -113,6 +114,8 @@
           - "{{ (commit_cve ~ ': ' if commit_cve else '') ~ 'update ' ~ (staged.stdout_lines | join(', ')) ~ ' from RHTPA SBOM audit' }}"
           - -m
           - "SBOMs: {{ bundle | map(attribute='sbom_name') | join(', ') }}\nApproved in AAP workflow job {{ awx_workflow_job_id | default('n/a') }}"
+          - -m
+          - "{{ requirements_approval | default('Approval summary not available.', true) }}"
         chdir: "{{ git_dir }}"
       when: staged.stdout | length > 0
 
