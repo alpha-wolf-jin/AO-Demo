@@ -63,11 +63,12 @@
           or git_repo_url '{{ git_repo_url }}' is not https://<host>/<owner>/<repo>[.git].
         quiet: true
 
+
     - name: Post to Slack
       ansible.builtin.include_tasks: tasks/slack_notify.yml
       vars:
         slack_status: completed
-        slack_title: "Approved"
+        slack_title: "Approved!"
         slack_new_thread: false
         slack_broadcast: false
 
