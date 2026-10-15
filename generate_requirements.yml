@@ -606,3 +606,13 @@
           requirements_review_dir: "{{ review_dir }}/{{ target_cve | default('no-cve', true) }}"
           requirements_approval: "{{ requirements_approval }}"
           requirements_content: "{{ requirements_content }}"
+
+    - name: Post to Slack
+      ansible.builtin.include_tasks: tasks/slack_notify.yml
+      vars:
+        slack_status: paused
+        slack_title: "{{ Wait for Approval }}"
+        slack_text: "{{ requirements_approval.splitlines() }}\n\nCheck the AAP job output for details.\nLink: https://myaap-ansible-automation-platform.apps.hub.lab.com/execution/jobs/playbook/{{ awx_job_id }}/output"
+        slack_new_thread: false
+        slack_broadcast: false
+
