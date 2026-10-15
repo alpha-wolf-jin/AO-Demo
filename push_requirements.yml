@@ -162,3 +162,13 @@
           {{ ('Pushed commit ' ~ gh_commit.json.sha[:12] ~ ' to ' ~ repo_path ~ '@' ~ target_branch ~ ': '
               ~ (bundle | map(attribute='requirements_file') | join(', ')))
              if gh_commit is not skipped else 'No changes pushed' }}
+
+    - name: Post to Slack
+      ansible.builtin.include_tasks: tasks/slack_notify.yml
+      vars:
+        slack_status: completed
+        slack_title: "Git Requirement File Updated!"
+        slack_text: "{{ bundle }}\n\nCheck the AAP job output for details.\nLink: https://myaap-ansible-automation-platform.apps.hub.lab.com/execution/jobs/playbook/{{ awx_job_id }}/output"
+        slack_new_thread: false
+        slack_broadcast: false
+
