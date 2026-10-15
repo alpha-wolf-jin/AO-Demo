@@ -239,7 +239,7 @@
       vars:
         slack_status: completed
         slack_title: "{{ cve_id }} in TPA"
-        slack_text: "{{ slack_info.document_id }} ID in TPA: {{ slack_info.id }}\n\nCheck the AAP job output for details.\nLink: https://myaap-ansible-automation-platform.apps.hub.lab.com/execution/jobs/playbook/{{ awx_job_id }}/output"
+        slack_text: "TPA CVE ID: {{ slack_info.id }}\n\nCheck the AAP job output for details.\nLink: https://myaap-ansible-automation-platform.apps.hub.lab.com/execution/jobs/playbook/{{ awx_job_id }}/output"
         slack_new_thread: false
         slack_broadcast: false
 
