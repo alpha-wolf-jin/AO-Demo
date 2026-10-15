@@ -5,8 +5,6 @@
 
   tasks:
 
-    - debug: var=report
-
     - name: Notify user via Email
       ansible.builtin.debug: 
         msg: "{{ report.description | split('\n') | list }}"
