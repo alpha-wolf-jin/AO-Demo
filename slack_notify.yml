@@ -17,6 +17,8 @@
     slack_text: >-
       A step in workflow job #{{ awx_workflow_job_id | default('n/a') }} failed.
       Check the AAP workflow for details.
+      link: https://myaap-ansible-automation-platform.apps.hub.lab.com/execution/jobs/playbook/374/output
+
     slack_broadcast: true
 
   tasks:
