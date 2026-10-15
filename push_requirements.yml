@@ -18,8 +18,8 @@
 # If the files already match, no commit is made.
 
 - name: Push approved requirements to GitHub (no clone)
-  hosts: localhost
-  connection: local
+  hosts: all
+  #connection: local
   gather_facts: false
 
   vars:
