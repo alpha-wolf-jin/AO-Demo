@@ -1,0 +1,156 @@
+---
+# AAP workflow node (after Approval): commit the approved requirements files to GitHub
+# WITHOUT cloning - uses the GitHub REST API (Git Data API), so all files land in ONE commit.
+#
+#   check_cve_impact  ->  generate_requirements  ->  [Approval]  ->  push_requirements
+#
+# Inputs (workflow artifacts via set_stats):
+#   requirements_bundle    list of {sbom_id, sbom_name, requirements_file, content}   <- generate_requirements (required)
+#   requirements_approval  approval message, added to the commit body                <- generate_requirements (optional)
+#   cve_impact_cve         CVE id for the commit title                               <- check_cve_impact (optional)
+#   The content is written exactly as the approver reviewed it - nothing is regenerated here.
+#
+# Credential: custom "Git push token" credential that injects env GIT_USER and GIT_TOKEN.
+#   The token needs "Contents: Read and write" on the repository (fine-grained PAT) or "repo" scope (classic).
+#   It is passed as url_password, which Ansible never prints.
+#
+# Steps: read branch head -> create tree (base = current tree + approved files) -> create commit -> move branch.
+# If the files already match, no commit is made.
+
+- name: Push approved requirements to GitHub (no clone)
+  hosts: all
+  #connection: local
+  gather_facts: false
+
+  vars:
+    bundle: "{{ requirements_bundle | default([]) }}"
+    commit_cve: "{{ cve_impact_cve | default(cve_id | default('')) }}"
+
+    #git_repo_url: ""
+    #git_branch: ""                     # empty = repository default branch
+    github_api: "https://api.github.com"   # GitHub Enterprise: https://<host>/api/v3
+    #git_user: "{{ lookup('env', 'GIT_USER') | default('alpha-wolf-jin', true) }}"
+    #git_token: "{{ lookup('env', 'GIT_TOKEN') }}"
+    validate_certs: false
+
+    # owner/repo taken from git_repo_url (https://github.com/<owner>/<repo>.git)
+    repo_path: "{{ git_repo_url | regex_replace('\\.git$', '') | regex_replace('^.*?://[^/]+/', '') }}"
+    api_repo: "{{ github_api }}/repos/{{ repo_path }}"
+    gh_headers:
+      Accept: application/vnd.github+json
+      X-GitHub-Api-Version: "2022-11-28"
+
+  module_defaults:
+    ansible.builtin.uri:
+      url_username: "{{ git_user }}"
+      url_password: "{{ git_token }}"
+      force_basic_auth: true
+      headers: "{{ gh_headers }}"
+      validate_certs: "{{ validate_certs }}"
+      body_format: json
+      return_content: true
+
+  tasks:
+    - name: Check inputs
+      ansible.builtin.assert:
+        that:
+          - bundle | length > 0
+          - git_token | length > 0
+          - repo_path is match('^[^/]+/[^/]+$')
+        fail_msg: >-
+          requirements_bundle is empty (did generate_requirements run before this node?),
+          GIT_TOKEN is not set (attach the Git push token credential),
+          or git_repo_url '{{ git_repo_url }}' is not https://<host>/<owner>/<repo>[.git].
+        quiet: true
+
+    - name: Get repository (for the default branch)
+      ansible.builtin.uri:
+        url: "{{ api_repo }}"
+      register: gh_repo
+      when: git_branch | length == 0
+
+    - name: Choose branch
+      ansible.builtin.set_fact:
+        target_branch: "{{ git_branch if git_branch | length > 0 else gh_repo.json.default_branch }}"
+
+    - name: Read branch head
+      ansible.builtin.uri:
+        url: "{{ api_repo }}/git/ref/heads/{{ target_branch }}"
+      register: gh_ref
+
+    - name: Read head commit
+      ansible.builtin.uri:
+        url: "{{ api_repo }}/git/commits/{{ gh_ref.json.object.sha }}"
+      register: gh_head
+
+    - name: Create tree with the approved files
+      ansible.builtin.uri:
+        url: "{{ api_repo }}/git/trees"
+        method: POST
+        status_code: [201]
+        body:
+          base_tree: "{{ gh_head.json.tree.sha }}"
+          tree: "{{ _tree_entries }}"
+      vars:
+        _tree_entries: >-
+          {%- set out = [] -%}
+          {%- for b in bundle -%}
+            {%- set _ = out.append({'path': b.requirements_file | regex_replace('^/+', ''),
+                                    'mode': '100644', 'type': 'blob', 'content': b.content}) -%}
+          {%- endfor -%}
+          {{ out }}
+      register: gh_tree
+
+    - name: Nothing to commit
+      ansible.builtin.debug:
+        msg: "Branch {{ target_branch }} already contains the approved content - no commit made."
+      when: gh_tree.json.sha == gh_head.json.tree.sha
+
+    - name: Create commit
+      ansible.builtin.uri:
+        url: "{{ api_repo }}/git/commits"
+        method: POST
+        status_code: [201]
+        body:
+          message: >-
+            {{ (commit_cve ~ ': ' if commit_cve else '') ~ 'update '
+               ~ (bundle | map(attribute='requirements_file') | join(', ')) ~ ' from RHTPA SBOM audit'
+               ~ nl ~ nl ~ 'SBOMs: ' ~ (bundle | map(attribute='sbom_name') | join(', '))
+               ~ nl ~ 'Approved in AAP workflow job ' ~ (awx_workflow_job_id | default('n/a'))
+               ~ nl ~ nl ~ (requirements_approval | default('Approval summary not available.', true)) }}
+          tree: "{{ gh_tree.json.sha }}"
+          parents: ["{{ gh_ref.json.object.sha }}"]
+      vars:
+        nl: "\n"
+      register: gh_commit
+      when: gh_tree.json.sha != gh_head.json.tree.sha
+
+    - name: Move branch to the new commit
+      ansible.builtin.uri:
+        url: "{{ api_repo }}/git/refs/heads/{{ target_branch }}"
+        method: PATCH
+        status_code: [200]
+        body:
+          sha: "{{ gh_commit.json.sha }}"
+          force: false                 # never overwrite commits pushed in the meantime
+      register: gh_update
+      failed_when: false
+      when: gh_commit is not skipped
+
+    - name: Fail clearly if the branch could not be updated
+      ansible.builtin.fail:
+        msg: >-
+          GitHub refused to update {{ target_branch }} (HTTP {{ gh_update.status }}):
+          {{ gh_update.json.message | default(gh_update.msg | default('')) }}.
+          {{ 'The branch moved while this job ran - rerun the job.' if gh_update.status == 422 else
+             'Check the token has write access and the branch is not protected.' }}
+      when:
+        - gh_update is not skipped
+        - gh_update.status != 200
+
+    - name: Result
+      ansible.builtin.debug:
+        msg: >-
+          {{ ('Pushed commit ' ~ gh_commit.json.sha[:12] ~ ' to ' ~ repo_path ~ '@' ~ target_branch ~ ': '
+              ~ (bundle | map(attribute='requirements_file') | join(', ')))
+             if gh_commit is not skipped else 'No changes pushed' }}

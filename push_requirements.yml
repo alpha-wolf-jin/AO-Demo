@@ -116,7 +116,6 @@
             {{ (commit_cve ~ ': ' if commit_cve else '') ~ 'update '
                ~ (bundle | map(attribute='requirements_file') | join(', ')) ~ ' from RHTPA SBOM audit'
                ~ nl ~ nl ~ 'SBOMs: ' ~ (bundle | map(attribute='sbom_name') | join(', '))
-               ~ nl ~ 'Approved in AAP workflow job ' ~ (awx_workflow_job_id | default('n/a'))
                ~ nl ~ nl ~ (requirements_approval | default('Approval summary not available.', true)) }}
           tree: "{{ gh_tree.json.sha }}"
           parents: ["{{ gh_ref.json.object.sha }}"]
