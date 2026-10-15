@@ -612,7 +612,7 @@
       vars:
         slack_status: paused
         slack_title: "{{ Wait for Approval }}"
-        slack_text: "{{ requirements_approval.splitlines() }}\n\nCheck the AAP job output for details.\nLink: https://myaap-ansible-automation-platform.apps.hub.lab.com/execution/jobs/playbook/{{ awx_job_id }}/output"
+        slack_text: "{{ requirements_approval }}\n\nCheck the AAP job output for details.\nLink: https://myaap-ansible-automation-platform.apps.hub.lab.com/execution/jobs/playbook/{{ awx_job_id }}/output"
         slack_new_thread: false
         slack_broadcast: false
 
