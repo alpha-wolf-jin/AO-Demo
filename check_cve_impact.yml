@@ -537,6 +537,17 @@
           cve_impact_vulnerable: "{{ vulnerable_sboms }}"
           cve_impact_sbom_files: "{{ sbom_downloads.results | default([]) | map(attribute='path') | list }}"
 
+
+
+    - name: Post to Slack
+      ansible.builtin.include_tasks: tasks/slack_notify.yml
+      vars:
+        slack_status: completed
+        slack_title: "SBOM Affected BY {{ target_cve }}"
+        slack_text: "{{ vulnerable_sboms }}\n\nCheck the AAP job output for details.\nLink: https://myaap-ansible-automation-platform.apps.hub.lab.com/execution/jobs/playbook/{{ awx_job_id }}/output"
+        slack_new_thread: false
+        slack_broadcast: false
+
     #- name: Fail job when vulnerable SBOMs found
     #  ansible.builtin.fail:
     #    msg: "{{ vulnerable_sboms | length }} SBOM(s) contain a vulnerable {{ pkg_name }} for {{ target_cve }}"
