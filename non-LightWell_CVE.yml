@@ -6,7 +6,7 @@
   tasks:
     - name: Notify user via Email
       ansible.builtin.debug: 
-        msg: "{{ report }}"
+        msg: "{{ report | split('\n') | list }}"
 
     - name: Post to Slack
       ansible.builtin.include_tasks: tasks/slack_notify.yml
