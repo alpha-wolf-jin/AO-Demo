@@ -9,12 +9,12 @@
 
     - name: Notify user via Email
       ansible.builtin.debug: 
-        msg: "{{ report | split('\n') | list }}"
+        msg: "{{ report.description | split('\n') | list }}"
 
     - name: Post to Slack
       ansible.builtin.include_tasks: tasks/slack_notify.yml
       vars:
         slack_status: failed
         slack_title: "CVE Remediation Rejected"
-        slack_text: "{{ report }}\nLink: https://myaap-ansible-automation-platform.apps.hub.lab.com/execution/jobs/playbook/{{ awx_job_id }}/output"
+        slack_text: "{{ report.description }}\nLink: https://myaap-ansible-automation-platform.apps.hub.lab.com/execution/jobs/playbook/{{ awx_job_id }}/output"
         slack_broadcast: false
