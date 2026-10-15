@@ -489,6 +489,6 @@
       vars:
         slack_status: completed
         slack_title: "{{ cve_record.cve_id }} - {{ cve_record.title }}"
-        slack_text: "{{ cve_record.description }}\n\n**Link**: https://myaap-ansible-automation-platform.apps.hub.lab.com/execution/jobs/playbook/{{ awx_job_id }}/output"
+        slack_text: "{{ cve_record.description }}\n\nCheck the AAP job output for details.\nLink: https://myaap-ansible-automation-platform.apps.hub.lab.com/execution/jobs/playbook/{{ awx_job_id }}/output"
         slack_new_thread: false
         slack_broadcast: false
