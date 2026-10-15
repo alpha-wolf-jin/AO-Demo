@@ -229,3 +229,13 @@
           - "Ingestion complete for {{ cve_id }} -> {{ pkg_purl }}"
           - "CVE record : HTTP {{ cve_upload.status }} {{ cve_upload.json | default(cve_upload.content | default('')) }}"
           - "CSAF VEX   : HTTP {{ csaf_upload.status }} {{ csaf_upload.json | default(csaf_upload.content | default('')) }}"
+
+    - name: Post to Slack
+      ansible.builtin.include_tasks: tasks/slack_notify.yml
+      vars:
+        slack_status: completed
+        slack_title: "{{ cve_record.cve_id }} in TPA"
+        slack_text: "{{ cve_upload.json | default(cve_upload.content | default('')) }}\n\nCheck the AAP job output for details.\nLink: https://myaap-ansible-automation-platform.apps.hub.lab.com/execution/jobs/playbook/{{ awx_job_id }}/output"
+        slack_new_thread: false
+        slack_broadcast: false
+
