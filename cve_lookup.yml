@@ -484,6 +484,15 @@
         data:
           cve_record: "{{ cve_record }}"
 
+    - name: Post to Slack
+      ansible.builtin.include_tasks: tasks/slack_notify.yml
+      vars:
+        slack_status: running
+        slack_title: "{{ cve_record.cve_id }} Info"
+        slack_text: "{{ cve_record.title }}\n\n**Link:** https://myaap-ansible-automation-platform.apps.hub.lab.com/execution/jobs/playbook/{{ awx_job_id }}/output"
+        slack_new_thread: false
+        slack_broadcast: false
+~                                   
     #- name: Write JSON report
     #  when: write_report | bool
     #  block:
