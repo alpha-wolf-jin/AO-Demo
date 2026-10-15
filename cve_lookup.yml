@@ -487,23 +487,8 @@
     - name: Post to Slack
       ansible.builtin.include_tasks: tasks/slack_notify.yml
       vars:
-        slack_status: running
+        slack_status: completed
         slack_title: "{{ cve_record.cve_id }} Info"
         slack_text: "{{ cve_record.title }}\n\nLink: https://myaap-ansible-automation-platform.apps.hub.lab.com/execution/jobs/playbook/{{ awx_job_id }}/output"
         slack_new_thread: false
         slack_broadcast: false
-~                                   
-    #- name: Write JSON report
-    #  when: write_report | bool
-    #  block:
-    #    - name: Ensure report directory exists
-    #      ansible.builtin.file:
-    #        path: "{{ output_dir }}"
-    #        state: directory
-    #        mode: "0755"
-
-    #    - name: Write {{ cve }}.json
-    #      ansible.builtin.copy:
-    #        content: "{{ cve_record | to_nice_json(indent=2) }}\n"
-    #        dest: "{{ output_dir }}/{{ cve }}.json"
-    #        mode: "0644"
