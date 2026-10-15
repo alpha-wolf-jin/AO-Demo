@@ -14,4 +14,5 @@
         slack_status: running
         slack_title: "{{ report | trim }} Investigation"
         #slack_text: "Start CVE {{ report | trim }} Investigation ... \nDemo Jam LightWell"
+        slack_new_thread: true
         slack_broadcast: false
