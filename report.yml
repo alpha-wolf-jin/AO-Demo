@@ -8,4 +8,10 @@
       ansible.builtin.debug: 
         msg: "{{ report | split('\n') | list }}"
 
-
+    - name: Post to Slack
+      ansible.builtin.include_tasks: tasks/slack_notify.yml
+      vars:
+        slack_status: completed
+        slack_title: "CVE remediation rejected"
+        slack_text: "{{ report }}"
+        slack_broadcast: true
