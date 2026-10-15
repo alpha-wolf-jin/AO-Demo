@@ -12,6 +12,6 @@
       ansible.builtin.include_tasks: tasks/slack_notify.yml
       vars:
         slack_status: running
-        slack_title: "CVE: {{ report | trim }}"
-        slack_text: "Start CVE {{ report | trim }} Investigation ... \nDemo Jam LightWell"
+        slack_title: "{{ report | trim }} Investigation"
+        #slack_text: "Start CVE {{ report | trim }} Investigation ... \nDemo Jam LightWell"
         slack_broadcast: false
