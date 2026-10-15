@@ -1,8 +1,8 @@
 - name: Send Health Summary Notification
   #hosts: localhost
-  hosts: bastion
-
+  hosts: all
   gather_facts: false
+
   tasks:
     - name: Notify user via Email
       ansible.builtin.debug: 
