@@ -11,7 +11,7 @@
     - name: Post to Slack
       ansible.builtin.include_tasks: tasks/slack_notify.yml
       vars:
-        slack_status: completed
-        slack_title: "CVE remediation rejected"
+        slack_status: failed
+        slack_title: "CVE Remediation Rejected"
         slack_text: "{{ report }}\nLink: https://myaap-ansible-automation-platform.apps.hub.lab.com/execution/jobs/playbook/{{ awx_job_id }}/output"
         slack_broadcast: false
