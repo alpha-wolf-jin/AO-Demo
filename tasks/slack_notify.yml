@@ -1,0 +1,73 @@
+---
+# Reusable: post a status message to Slack via /root/slack/notify_status_3_9.py on the bastion.
+#
+# Usage (from any playbook in the same project):
+#   - ansible.builtin.include_tasks: tasks/slack_notify.yml
+#     vars:
+#       slack_status: running                 # running | completed | failed | paused
+#       slack_title: "CVE impact check started"
+#       slack_text: "Job #{{ awx_job_id | default('n/a') }}"     # optional, multi-line OK
+#       slack_new_thread: false               # true = open a new thread (first message of a run)
+#       slack_broadcast: false                # true = also show this reply in the channel (final status)
+#
+# Thread handling:
+#   - slack_new_thread: true  -> opens a thread and publishes its ts as the job artifact `slack_thread_ts`
+#                                (set_stats). The orchestrator passes it as an extra var to every later
+#                                job, so they all reply in the same thread.
+#   - otherwise               -> replies in `slack_thread_ts` if it is set, else posts a standalone message.
+#
+# A Slack problem never fails the job: it is reported as a warning in the log.
+
+- name: Slack | post "{{ slack_title }}"
+  when: slack_enabled | default(true) | bool
+  vars:
+    _host: "{{ slack_host | default(groups['bastion'][0] if (groups['bastion'] | default([])) | length > 0 else inventory_hostname) }}"
+    _thread: "{{ slack_thread_ts | default('') | string | trim }}"
+    _nl: "\n"
+    # Slack limits: header text 150 chars, section text 3000 chars
+    _title: "{{ slack_title | string | truncate(140, true, '...') }}"
+    _text: >-
+      {{ (slack_text | default('') | string | truncate(2900, true, '')
+          ~ ((_nl ~ '_(truncated - full details in the AAP job output)_') if (slack_text | default('') | string | length) > 2900 else ''))
+         if slack_text | default('') | string | length > 0 else '' }}
+    _argv: >-
+      {{ [slack_python | default('/root/slack/.venv/bin/python'),
+          slack_script | default('/root/slack/notify_status_3_9.py'),
+          slack_status, _title]
+         + ([_text] if _text | length > 0 else [])
+         + (['--thread', _thread] if (_thread | length > 0 and not (slack_new_thread | default(false) | bool)) else [])
+         + (['--broadcast'] if (slack_broadcast | default(false) | bool and _thread | length > 0
+                                and not (slack_new_thread | default(false) | bool)) else []) }}
+  block:
+    - name: Slack | run notify script on {{ _host }}
+      ansible.builtin.command:
+        argv: "{{ _argv }}"
+      delegate_to: "{{ _host }}"
+      run_once: true
+      register: _slack_out
+      changed_when: false
+      failed_when: false
+
+    - name: Slack | warn if the message was not posted
+      ansible.builtin.debug:
+        msg: "WARNING: Slack notification failed (rc={{ _slack_out.rc }}): {{ _slack_out.stderr | default(_slack_out.msg | default('')) }}"
+      when: _slack_out.rc | default(1) != 0
+      run_once: true
+
+    - name: Slack | remember the new thread
+      ansible.builtin.set_fact:
+        slack_thread_ts: "{{ _slack_out.stdout | trim }}"
+      when:
+        - slack_new_thread | default(false) | bool
+        - _slack_out.rc | default(1) == 0
+        - _slack_out.stdout | trim | length > 0
+
+    - name: Slack | publish the thread to downstream workflow nodes
+      ansible.builtin.set_stats:
+        data:
+          slack_thread_ts: "{{ slack_thread_ts }}"
+      when:
+        - slack_new_thread | default(false) | bool
+        - _slack_out.rc | default(1) == 0
+        - _slack_out.stdout | trim | length > 0
+      run_once: true

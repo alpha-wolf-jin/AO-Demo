@@ -1,0 +1,24 @@
+---
+# Standalone AAP job: post one Slack status message in the workflow's thread.
+# Use it as a workflow node, e.g.
+#   - on the FAILURE path of any node          (slack_status: failed, slack_broadcast: true)
+#   - right before the Approval node           (slack_status: paused, text = requirements_approval)
+#
+# Set slack_status / slack_title / slack_text in the node's extra vars.
+# slack_thread_ts arrives automatically from the node that opened the thread.
+
+- name: Post Slack status
+  hosts: bastion
+  gather_facts: false
+
+  vars:
+    slack_status: failed
+    slack_title: "CVE remediation workflow failed"
+    slack_text: >-
+      A step in workflow job #{{ awx_workflow_job_id | default('n/a') }} failed.
+      Check the AAP workflow for details.
+    slack_broadcast: true
+
+  tasks:
+    - name: Post to Slack
+      ansible.builtin.include_tasks: tasks/slack_notify.yml
