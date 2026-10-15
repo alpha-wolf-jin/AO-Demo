@@ -163,12 +163,30 @@
               ~ (bundle | map(attribute='requirements_file') | join(', ')))
              if gh_commit is not skipped else 'No changes pushed' }}
 
+    - name: Build Slack text for the requirements bundle
+      vars:
+        nl: "\n"
+        fence: "```"
+      ansible.builtin.set_fact:
+        slack_bundle_text: >-
+          {%- set L = ['*' ~ (requirements_bundle | length) ~ ' requirements file(s)*'] -%}
+          {%- for b in requirements_bundle -%}
+            {%- set lines = b.content | trim | split(nl) -%}
+            {%- set _ = L.append('') -%}
+            {%- set _ = L.append(':package: *' ~ b.sbom_name ~ '*  (' ~ (lines | length) ~ ' packages)') -%}
+            {%- set _ = L.append(':page_facing_up: `' ~ b.requirements_file ~ '`') -%}
+            {%- set _ = L.append(fence) -%}
+            {%- set _ = L.extend(lines) -%}
+            {%- set _ = L.append(fence) -%}
+          {%- endfor -%}
+          {{ L | join(nl) }}
+
     - name: Post to Slack
       ansible.builtin.include_tasks: tasks/slack_notify.yml
       vars:
         slack_status: completed
-        slack_title: "Git Requirement File Updated!"
-        slack_text: "{{ bundle }}\n\nCheck the AAP job output for details.\nLink: https://myaap-ansible-automation-platform.apps.hub.lab.com/execution/jobs/playbook/{{ awx_job_id }}/output"
+        slack_title: "Requirements pushed to Git"
+        slack_text: "{{ slack_bundle_text }}\n\nCheck the AAP job output for details.\nLink: https://myaap-ansible-automation-platform.apps.hub.lab.com/execution/jobs/playbook/{{ awx_job_id }}/output"
         slack_new_thread: false
         slack_broadcast: false
 
