@@ -21,8 +21,7 @@
 # Controller requirements: ansible-core only (no jmespath / extra collections).
 
 - name: CVE detail lookup
-  hosts: localhost
-  connection: local
+  hosts: all
   gather_facts: false
 
   vars:
