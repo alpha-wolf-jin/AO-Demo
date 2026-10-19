@@ -169,14 +169,31 @@
         cvss_list: []
 
     # ------------------------------------------------- open-source packages
-    - name: Query OSV for each GitHub advisory
+    # OSV's record for a CVE ID often has no package data; it lives on the GHSA / PYSEC alias.
+    - name: Query OSV by CVE ID (for its aliases)
       ansible.builtin.uri:
-        url: "https://api.osv.dev/v1/vulns/{{ item.ghsa_id }}"
+        url: "https://api.osv.dev/v1/vulns/{{ cve }}"
         return_content: true
         timeout: "{{ http_timeout }}"
-      loop: "{{ src_ghsa }}"
-      loop_control:
-        label: "{{ item.ghsa_id }}"
+      register: osv_cve_resp
+      failed_when: false
+
+    - name: Choose OSV advisory IDs to fetch (GHSA preferred, PYSEC as fallback)
+      ansible.builtin.set_fact:
+        osv_ids: >-
+          {{ ghsa_ids if ghsa_ids | length > 0 else (osv_aliases | select('match', '^PYSEC-') | list) }}
+      vars:
+        osv_aliases: "{{ osv_cve_resp.json.aliases | default([]) if (osv_cve_resp.status | default(0)) == 200 else [] }}"
+        ghsa_ids: >-
+          {{ ((src_ghsa | map(attribute='ghsa_id') | list)
+              + (osv_aliases | select('match', '^GHSA-') | list)) | unique }}
+
+    - name: Query OSV for each advisory
+      ansible.builtin.uri:
+        url: "https://api.osv.dev/v1/vulns/{{ item }}"
+        return_content: true
+        timeout: "{{ http_timeout }}"
+      loop: "{{ osv_ids }}"
       register: osv_resp
       failed_when: false
 
@@ -188,14 +205,27 @@
              | map(attribute='json') | map(attribute='affected', default=[])
              | flatten(levels=1) | list }}
 
-    - name: Build package URLs (last affected version) and fixed versions from OSV
+    - name: Build package URLs (highest affected version) and fixed versions from OSV
       ansible.builtin.set_fact:
-        pkg_purls: "{{ pkg_purls + [item.package.purl ~ (('@' ~ item.versions | last) if item.versions | default([]) | length > 0 else '')] }}"
+        pkg_purls: "{{ pkg_purls + [item.package.purl ~ at_version] }}"
         pkg_fixed: >-
           {{ pkg_fixed
              + (item.ranges | default([]) | map(attribute='events') | flatten(levels=1)
                 | selectattr('fixed', 'defined') | map(attribute='fixed')
                 | map('regex_replace', '^', item.package.name ~ '@') | list) }}
+      vars:
+        # OSV lists versions in text order (1.9.1 sorts after 1.24.1), so pick the max by
+        # version comparison. PEP 440 for PyPI; other ecosystems keep OSV's last entry.
+        at_version: >-
+          {%- set ns = namespace(v='') -%}
+          {%- if item.package.ecosystem | default('') == 'PyPI' -%}
+          {%- for x in item.versions | default([]) -%}
+          {%- if ns.v == '' or x is version(ns.v, '>', version_type='pep440') -%}{%- set ns.v = x -%}{%- endif -%}
+          {%- endfor -%}
+          {%- else -%}
+          {%- set ns.v = item.versions | default([]) | last | default('') -%}
+          {%- endif -%}
+          {{ ('@' ~ ns.v) if ns.v | length > 0 else '' }}
       loop: "{{ osv_affected }}"
       loop_control:
         label: "{{ item.package.name | default('?') }}"
@@ -207,9 +237,9 @@
         pkg_fixed: "{{ pkg_fixed + ([item.package.name ~ '@' ~ fpv] if fpv | length > 0 else []) }}"
       vars:
         fpv: >-
-          {{ ((item.first_patched_version.identifier | default(''))
-              if item.first_patched_version is mapping
-              else item.first_patched_version) | default('', true) | string }}
+          {{ (((item.first_patched_version | default('')).identifier | default(''))
+              if (item.first_patched_version | default('')) is mapping
+              else (item.first_patched_version | default('', true))) | string }}
       loop: "{{ src_ghsa | map(attribute='vulnerabilities', default=[]) | flatten(levels=1) | list }}"
       loop_control:
         label: "{{ item.package.name | default('?') }}"
@@ -441,8 +471,9 @@
           vendor_notes:
             red_hat_statement: "{{ src_rh.statement | default('') | trim }}"
             red_hat_mitigation: >-
-              {{ ((src_rh.mitigation.value | default('')) if src_rh.mitigation is mapping
-                  else (src_rh.mitigation | default(''))) | trim }}
+              {{ (((src_rh.mitigation | default('')).value | default(''))
+                  if (src_rh.mitigation | default('')) is mapping
+                  else (src_rh.mitigation | default('', true))) | string | trim }}
             cna_workarounds: >-
               {{ src_cna.workarounds | default([]) | selectattr('lang', 'match', '^en')
                  | map(attribute='value') | list }}
