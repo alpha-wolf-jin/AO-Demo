@@ -8,7 +8,8 @@
 #   requirements_bundle    list of {sbom_id, sbom_name, requirements_file, content}   <- generate_requirements (required)
 #   requirements_approval  approval message, added to the commit body                <- generate_requirements (optional)
 #   cve_impact_cve         CVE id for the commit title                               <- check_cve_impact (optional)
-#   The content is written exactly as the approver reviewed it - nothing is regenerated here.
+#   The content is written exactly as the approver reviewed it - nothing is regenerated here,
+#   except the rhlw separator fix below (rhlw_fix_separator).
 #
 # Credential: custom "Git push token" credential that injects env GIT_USER and GIT_TOKEN.
 #   The token needs "Contents: Read and write" on the repository (fine-grained PAT) or "repo" scope (classic).
@@ -32,6 +33,11 @@
     #git_user: "{{ lookup('env', 'GIT_USER') | default('alpha-wolf-jin', true) }}"
     #git_token: "{{ lookup('env', 'GIT_TOKEN') }}"
     validate_certs: false
+
+    # Rewrite the old rhlw convention "<ver>.rhlw-<build>" to "<ver>-rhlw-<build>"
+    #   gunicorn==20.1.0.rhlw-00001  ->  gunicorn==20.1.0-rhlw-00001
+    # Only needed for bundles generated before rhlw_requirements.yml switched to "-rhlw-".
+    rhlw_fix_separator: true
 
     # owner/repo taken from git_repo_url (https://github.com/<owner>/<repo>.git)
     repo_path: "{{ git_repo_url | regex_replace('\\.git$', '') | regex_replace('^.*?://[^/]+/', '') }}"
@@ -62,6 +68,33 @@
           GIT_TOKEN is not set (attach the Git push token credential),
           or git_repo_url '{{ git_repo_url }}' is not https://<host>/<owner>/<repo>[.git].
         quiet: true
+
+    - name: Rewrite old rhlw versions (.rhlw-NNNNN -> -rhlw-NNNNN)
+      ansible.builtin.set_fact:
+        fixed_bundle: >-
+          {{ fixed_bundle | default([])
+             + [item | combine({'content': item.content | regex_replace('(?<=[0-9])[.](?=rhlw-[0-9])', '-')})] }}
+      loop: "{{ bundle }}"
+      loop_control:
+        label: "{{ item.requirements_file }}"
+      when: rhlw_fix_separator | bool
+
+    - name: Use the rewritten bundle
+      ansible.builtin.set_fact:
+        rhlw_rewritten: >-
+          {{ bundle | map(attribute='content') | map('regex_findall', '(?m)^.*[0-9][.]rhlw-[0-9]+.*$')
+             | flatten | list }}
+        bundle: "{{ fixed_bundle }}"
+      when: rhlw_fix_separator | bool
+
+    - name: Report rhlw lines that were rewritten
+      ansible.builtin.debug:
+        msg: >-
+          {{ ['Rewritten to -rhlw- (' ~ (rhlw_rewritten | length) ~ ' line(s)):']
+             + (rhlw_rewritten | map('regex_replace', '(?<=[0-9])[.](?=rhlw-[0-9])', '-') | list) }}
+      when:
+        - rhlw_fix_separator | bool
+        - rhlw_rewritten | length > 0
 
 
     - name: Post to Slack
@@ -125,7 +158,10 @@
             {{ (commit_cve ~ ': ' if commit_cve else '') ~ 'update '
                ~ (bundle | map(attribute='requirements_file') | join(', ')) ~ ' from RHTPA SBOM audit'
                ~ nl ~ nl ~ 'SBOMs: ' ~ (bundle | map(attribute='sbom_name') | join(', '))
-               ~ nl ~ nl ~ (requirements_approval | default('Approval summary not available.', true)) }}
+               ~ nl ~ nl ~ (requirements_approval | default('Approval summary not available.', true))
+               ~ ((nl ~ nl ~ 'Note: rhlw versions rewritten from .rhlw-NNNNN to -rhlw-NNNNN after approval: '
+                   ~ (rhlw_rewritten | map('regex_replace', '(?<=[0-9])[.](?=rhlw-[0-9])', '-') | join(', ')))
+                  if (rhlw_rewritten | default([]) | length > 0) else '') }}
           tree: "{{ gh_tree.json.sha }}"
           parents: ["{{ gh_ref.json.object.sha }}"]
       vars:
@@ -169,8 +205,8 @@
         fence: "```"
       ansible.builtin.set_fact:
         slack_bundle_text: >-
-          {%- set L = ['*' ~ (requirements_bundle | length) ~ ' requirements file(s)*'] -%}
-          {%- for b in requirements_bundle -%}
+          {%- set L = ['*' ~ (bundle | length) ~ ' requirements file(s)*'] -%}
+          {%- for b in bundle -%}
             {%- set lines = b.content | trim | split(nl) -%}
             {%- set _ = L.append('') -%}
             {%- set _ = L.append(':package: *' ~ b.sbom_name ~ '*  (' ~ (lines | length) ~ ' packages)') -%}
