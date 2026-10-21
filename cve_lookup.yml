@@ -35,7 +35,7 @@
     write_report: true
     http_timeout: 30
     # git_token = extra var injected by the AAP custom credential; GITHUB_TOKEN env var as fallback
-    github_token: "{{ git_token | default(lookup('ansible.builtin.env', 'GITHUB_TOKEN'), true) | default('', true) }}"
+    github_token: "{{ (git_token | default(lookup('ansible.builtin.env', 'GITHUB_TOKEN'), true) | default('', true)) | string | trim }}"
     nvd_api_key: "{{ lookup('ansible.builtin.env', 'NVD_API_KEY') | default('', true) }}"
 
     gh_headers: >-
@@ -140,14 +140,21 @@
         return_content: true
         timeout: "{{ http_timeout }}"
       register: ghsa_resp
+      failed_when: false
+      ignore_errors: true                          # also covers errors before the request is sent
       no_log: "{{ github_token | length > 0 }}"   # keep the token out of the job output
 
-    - name: Show GitHub Advisory API result (token hidden)
+    - name: Show GitHub Advisory API result (token masked)
+      vars:
+        tok: "{{ github_token | string }}"
+        raw_msg: "{{ ghsa_resp.msg | default('') | string }}"
+        safe_msg: "{{ raw_msg | replace(tok, '***') if tok | length > 0 else raw_msg }}"
       ansible.builtin.debug:
-        msg: >-
-          GitHub Advisory API: HTTP {{ ghsa_resp.status | default('n/a') }},
-          token {{ 'used' if github_token | length > 0 else 'NOT set (60 requests/hour limit)' }},
-          rate limit remaining {{ ghsa_resp.x_ratelimit_remaining | default('n/a') }}
+        msg:
+          - "GitHub Advisory API: HTTP {{ ghsa_resp.status | default('n/a') }}"
+          - "Token        : {{ 'used (' ~ (tok | length) ~ ' chars' ~ (', contains whitespace/newline!' if tok is search('\\s') else '') ~ ')' if tok | length > 0 else 'NOT set (60 requests/hour limit)' }}"
+          - "Rate limit   : {{ ghsa_resp.x_ratelimit_remaining | default('n/a') }} remaining"
+          - "Error        : {{ safe_msg | truncate(400) if (ghsa_resp.status | default(0)) != 200 else 'none' }}"
       failed_when: false
 
     - name: Query Red Hat Security Data API
