@@ -8,7 +8,6 @@
 #
 # Optional environment variables:
 #   GITHUB_TOKEN  raises the GitHub Advisory API limit from 60 to 5,000 requests/hour
-#                 (the git_token extra var from the AAP custom credential is used first)
 #   NVD_API_KEY   raises the NVD API limit from 5 to 50 requests per 30 seconds
 #
 # Sources (all optional - the record is built from whichever ones answer):
@@ -34,8 +33,7 @@
     output_dir: "{{ playbook_dir }}/cve_reports"
     write_report: true
     http_timeout: 30
-    # git_token = extra var injected by the AAP custom credential; GITHUB_TOKEN env var as fallback
-    github_token: "{{ (git_token | default(lookup('ansible.builtin.env', 'GITHUB_TOKEN'), true) | default('', true)) | string | trim }}"
+    github_token: "{{ lookup('ansible.builtin.env', 'GITHUB_TOKEN') | default('', true) }}"
     nvd_api_key: "{{ lookup('ansible.builtin.env', 'NVD_API_KEY') | default('', true) }}"
 
     gh_headers: >-
@@ -72,24 +70,6 @@
       SwiftURL: [Package.swift, Package.resolved]
       GitHub Actions: [".github/workflows/*.yml", ".github/workflows/*.yaml"]
       Red Hat: [Containerfile, Dockerfile, "*.spec", "*.ks"]
-
-    # GitHub advisory ecosystem -> purl type (fallback package URLs when OSV gives no data)
-    purl_type_by_ghsa_ecosystem:
-      pip: pypi
-      npm: npm
-      maven: maven
-      go: golang
-      nuget: nuget
-      rubygems: gem
-      composer: composer
-      rust: cargo
-      erlang: hex
-      pub: pub
-      swift: swift
-
-    # OSV retries: OSV is the only source of versioned package URLs, so retry transient errors
-    osv_retries: 3
-    osv_retry_delay: 5
 
     cpe_part_names:
       a: application
@@ -140,21 +120,6 @@
         return_content: true
         timeout: "{{ http_timeout }}"
       register: ghsa_resp
-      failed_when: false
-      ignore_errors: true                          # also covers errors before the request is sent
-      no_log: "{{ github_token | length > 0 }}"   # keep the token out of the job output
-
-    - name: Show GitHub Advisory API result (token masked)
-      vars:
-        tok: "{{ github_token | string }}"
-        raw_msg: "{{ ghsa_resp.msg | default('') | string }}"
-        safe_msg: "{{ raw_msg | replace(tok, '***') if tok | length > 0 else raw_msg }}"
-      ansible.builtin.debug:
-        msg:
-          - "GitHub Advisory API: HTTP {{ ghsa_resp.status | default('n/a') }}"
-          - "Token        : {{ 'used (' ~ (tok | length) ~ ' chars' ~ (', contains whitespace/newline!' if tok is search('\\s') else '') ~ ')' if tok | length > 0 else 'NOT set (60 requests/hour limit)' }}"
-          - "Rate limit   : {{ ghsa_resp.x_ratelimit_remaining | default('n/a') }} remaining"
-          - "Error        : {{ safe_msg | truncate(400) if (ghsa_resp.status | default(0)) != 200 else 'none' }}"
       failed_when: false
 
     - name: Query Red Hat Security Data API
@@ -211,9 +176,6 @@
         return_content: true
         timeout: "{{ http_timeout }}"
       register: osv_cve_resp
-      until: osv_cve_resp.status | default(0) in [200, 404]
-      retries: "{{ osv_retries }}"
-      delay: "{{ osv_retry_delay }}"
       failed_when: false
 
     - name: Choose OSV advisory IDs to fetch (GHSA preferred, PYSEC as fallback)
@@ -233,21 +195,7 @@
         timeout: "{{ http_timeout }}"
       loop: "{{ osv_ids }}"
       register: osv_resp
-      until: osv_resp.status | default(0) in [200, 404]
-      retries: "{{ osv_retries }}"
-      delay: "{{ osv_retry_delay }}"
       failed_when: false
-
-    - name: Report OSV advisory lookups that failed
-      ansible.builtin.debug:
-        msg: >-
-          WARNING: OSV lookup for {{ item.item }} returned
-          {{ item.status | default('no response') }} {{ item.msg | default('') | truncate(150) }}.
-          Package URLs will fall back to GitHub data (no version).
-      loop: "{{ osv_resp.results | default([]) }}"
-      loop_control:
-        label: "{{ item.item }}"
-      when: item.status | default(0) != 200
 
     - name: Collect OSV affected-package entries
       ansible.builtin.set_fact:
@@ -296,30 +244,6 @@
       loop_control:
         label: "{{ item.package.name | default('?') }}"
       when: item.package.name is defined
-
-    # OSV failed or had no package data: build unversioned purls from GitHub so the record
-    # still identifies the package (pkg:pypi/flask instead of pkg:pypi/flask@3.1.2).
-    - name: Fallback package URLs from GitHub when OSV gave none
-      ansible.builtin.set_fact:
-        pkg_purls: >-
-          {%- set out = [] -%}
-          {%- for v in src_ghsa | map(attribute='vulnerabilities', default=[]) | flatten(levels=1) -%}
-            {%- set name = (v.package | default({})).name | default('') -%}
-            {%- set ptype = purl_type_by_ghsa_ecosystem[((v.package | default({})).ecosystem | default('')) | lower] | default('') -%}
-            {%- if name and ptype -%}
-              {%- if ptype == 'pypi' -%}{%- set name = name | lower | regex_replace('[-_.]+', '-') -%}
-              {%- elif ptype == 'maven' -%}{%- set name = name | replace(':', '/') -%}{%- endif -%}
-              {%- set _ = out.append('pkg:' ~ ptype ~ '/' ~ name) -%}
-            {%- endif -%}
-          {%- endfor -%}
-          {{ out | unique | list }}
-        purls_from: github-fallback
-      when: pkg_purls | length == 0
-
-    - name: Warn when package URLs came from the GitHub fallback
-      ansible.builtin.debug:
-        msg: "WARNING: OSV gave no package data; using unversioned package URLs from GitHub: {{ pkg_purls }}"
-      when: purls_from | default('') == 'github-fallback'
 
     # ---------------------------------------------------- RHEL / OS packages
     - name: Red Hat fixed releases - RPM purls, CPEs and advisories
