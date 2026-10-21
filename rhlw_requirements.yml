@@ -716,6 +716,6 @@
       vars:
         slack_status: paused
         slack_title: "Wait for Approval{{ ' (rhlw)' if rhlw | bool else '' }}"
-        slack_text: "{{ slack_approval_text }}\n\nApproval Action Required.\nLink: https://automation-orchestrator-automation-orchestrator.apps.hub.lab.com/approvals"
+        slack_text: "{{ slack_approval_text }}\n\n*Approval Action Required*\nLink: https://automation-orchestrator-automation-orchestrator.apps.hub.lab.com/approvals"
         slack_new_thread: false
         slack_broadcast: false
