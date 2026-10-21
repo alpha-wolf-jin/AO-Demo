@@ -1,0 +1,525 @@
+---
+# cve_lookup.yml - look up any CVE across public sources and emit one normalised JSON record.
+#
+# Usage:
+#   ansible-playbook cve_lookup.yml -e cve_id=CVE-2024-23334
+#   ansible-playbook cve_lookup.yml -e cve_id=CVE-2024-6387 -e "rh_products='Red Hat Enterprise Linux 9'"
+#   ansible-playbook cve_lookup.yml -e cve_id=CVE-2024-6387 -e write_report=false
+#
+# Optional environment variables:
+#   GITHUB_TOKEN  raises the GitHub Advisory API limit from 60 to 5,000 requests/hour
+#   NVD_API_KEY   raises the NVD API limit from 5 to 50 requests per 30 seconds
+#
+# Sources (all optional - the record is built from whichever ones answer):
+#   CVE.org        title, description, CNA/ADP CVSS, CPEs, solutions, workarounds, CISA KEV + SSVC
+#   NVD            description fallback, vulnerable CPE matches, NVD CVSS, CWE, CISA KEV fields
+#   GitHub (GHSA)  ecosystem, repository URL, vulnerable ranges, first patched version
+#   OSV.dev        package URLs, affected and fixed versions
+#   Red Hat        RPM purls, product CPEs, severity, statement, mitigation, RHSA, fix state
+#   FIRST EPSS     probability of exploitation in the next 30 days
+#
+# Controller requirements: ansible-core only (no jmespath / extra collections).
+
+- name: CVE detail lookup
+  hosts: all
+  gather_facts: false
+
+  vars:
+    cve_id: ""
+    # Limit Red Hat advisories / product status to these products (substring match).
+    # List, or comma-separated string from the CLI. Empty = all products.
+    rh_products: []
+    query_epss: true
+    output_dir: "{{ playbook_dir }}/cve_reports"
+    write_report: true
+    http_timeout: 30
+    github_token: "{{ lookup('ansible.builtin.env', 'GITHUB_TOKEN') | default('', true) }}"
+    nvd_api_key: "{{ lookup('ansible.builtin.env', 'NVD_API_KEY') | default('', true) }}"
+
+    gh_headers: >-
+      {{ {'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'}
+         | combine({'Authorization': 'Bearer ' ~ github_token} if github_token | length > 0 else {}) }}
+
+    # GitHub advisory ecosystem names -> OSV / purl-style names
+    ghsa_ecosystem_map:
+      pip: PyPI
+      npm: npm
+      maven: Maven
+      go: Go
+      nuget: NuGet
+      rubygems: RubyGems
+      composer: Packagist
+      rust: crates.io
+      erlang: Hex
+      pub: Pub
+      swift: SwiftURL
+      actions: GitHub Actions
+
+    # Files to scan in a repository to see whether it depends on the affected package
+    manifest_files_by_ecosystem:
+      PyPI: [requirements.txt, pyproject.toml, setup.py, setup.cfg, Pipfile, Pipfile.lock, poetry.lock, uv.lock]
+      npm: [package.json, package-lock.json, yarn.lock, pnpm-lock.yaml]
+      Maven: [pom.xml, build.gradle, build.gradle.kts, gradle.lockfile]
+      Go: [go.mod, go.sum]
+      NuGet: ["*.csproj", packages.config, packages.lock.json, Directory.Packages.props]
+      RubyGems: [Gemfile, Gemfile.lock, "*.gemspec"]
+      Packagist: [composer.json, composer.lock]
+      crates.io: [Cargo.toml, Cargo.lock]
+      Hex: [mix.exs, mix.lock]
+      Pub: [pubspec.yaml, pubspec.lock]
+      SwiftURL: [Package.swift, Package.resolved]
+      GitHub Actions: [".github/workflows/*.yml", ".github/workflows/*.yaml"]
+      Red Hat: [Containerfile, Dockerfile, "*.spec", "*.ks"]
+
+    cpe_part_names:
+      a: application
+      o: operating system
+      h: hardware
+
+  tasks:
+    # ------------------------------------------------------------------ input
+    - name: Normalise inputs
+      ansible.builtin.set_fact:
+        cve: "{{ cve_id | string | trim | upper }}"
+        rh_product_filter: >-
+          {{ (rh_products.split(',') if rh_products is string else rh_products)
+             | map('trim') | select | list }}
+
+    - name: Validate CVE ID format
+      ansible.builtin.assert:
+        that:
+          - cve is match('^CVE-[0-9]{4}-[0-9]{4,}$')
+        fail_msg: "Invalid or missing cve_id '{{ cve_id }}'. Example: -e cve_id=CVE-2024-23334"
+        quiet: true
+
+    # ---------------------------------------------------------------- queries
+    - name: Query CVE.org (CVE Services)
+      ansible.builtin.uri:
+        url: "https://cveawg.mitre.org/api/cve/{{ cve }}"
+        return_content: true
+        timeout: "{{ http_timeout }}"
+      register: cveorg_resp
+      failed_when: false
+
+    - name: Query NVD API 2.0
+      ansible.builtin.uri:
+        url: "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={{ cve }}"
+        headers: "{{ {'apiKey': nvd_api_key} if nvd_api_key | length > 0 else {} }}"
+        return_content: true
+        timeout: "{{ http_timeout }}"
+      register: nvd_resp
+      until: nvd_resp.status | default(0) in [200, 404]
+      retries: 3
+      delay: 10
+      ignore_errors: true   # NVD rate-limits (403/503); continue with other sources
+
+    - name: Query GitHub Advisory Database
+      ansible.builtin.uri:
+        url: "https://api.github.com/advisories?cve_id={{ cve }}&per_page=100"
+        headers: "{{ gh_headers }}"
+        return_content: true
+        timeout: "{{ http_timeout }}"
+      register: ghsa_resp
+      failed_when: false
+
+    - name: Query Red Hat Security Data API
+      ansible.builtin.uri:
+        url: "https://access.redhat.com/hydra/rest/securitydata/cve/{{ cve }}.json"
+        return_content: true
+        timeout: "{{ http_timeout }}"
+      register: rh_resp
+      failed_when: false
+
+    - name: Query FIRST EPSS
+      ansible.builtin.uri:
+        url: "https://api.first.org/data/v1/epss?cve={{ cve }}"
+        return_content: true
+        timeout: "{{ http_timeout }}"
+      register: epss_resp
+      failed_when: false
+      when: query_epss | bool
+
+    # ------------------------------------------------------------- normalise
+    - name: Keep only successful source payloads
+      ansible.builtin.set_fact:
+        src_cveorg: "{{ cveorg_resp.json if (cveorg_resp.status | default(0)) == 200 else {} }}"
+        src_nvd: >-
+          {{ nvd_resp.json.vulnerabilities[0].cve
+             if (nvd_resp.status | default(0)) == 200 and (nvd_resp.json.totalResults | default(0) | int) > 0
+             else {} }}
+        src_ghsa: "{{ ghsa_resp.json if (ghsa_resp.status | default(0)) == 200 else [] }}"
+        src_rh: "{{ rh_resp.json if (rh_resp.status | default(0)) == 200 else {} }}"
+        src_epss: >-
+          {{ epss_resp.json.data[0]
+             if (epss_resp.status | default(0)) == 200 and (epss_resp.json.data | default([]) | length) > 0
+             else {} }}
+
+    - name: Split CVE.org record and initialise accumulators
+      ansible.builtin.set_fact:
+        src_cna: "{{ src_cveorg.containers.cna | default({}) }}"
+        src_adp: "{{ src_cveorg.containers.adp | default([]) }}"
+        cve_state: "{{ src_cveorg.cveMetadata.state | default('UNKNOWN') }}"
+        pkg_purls: []
+        pkg_fixed: []
+        ghsa_ranges: []
+        rh_purls: []
+        rh_cpes: []
+        rh_advisories: []
+        rh_product_status: []
+        cvss_list: []
+
+    # ------------------------------------------------- open-source packages
+    # OSV's record for a CVE ID often has no package data; it lives on the GHSA / PYSEC alias.
+    - name: Query OSV by CVE ID (for its aliases)
+      ansible.builtin.uri:
+        url: "https://api.osv.dev/v1/vulns/{{ cve }}"
+        return_content: true
+        timeout: "{{ http_timeout }}"
+      register: osv_cve_resp
+      failed_when: false
+
+    - name: Choose OSV advisory IDs to fetch (GHSA preferred, PYSEC as fallback)
+      ansible.builtin.set_fact:
+        osv_ids: >-
+          {{ ghsa_ids if ghsa_ids | length > 0 else (osv_aliases | select('match', '^PYSEC-') | list) }}
+      vars:
+        osv_aliases: "{{ osv_cve_resp.json.aliases | default([]) if (osv_cve_resp.status | default(0)) == 200 else [] }}"
+        ghsa_ids: >-
+          {{ ((src_ghsa | map(attribute='ghsa_id') | list)
+              + (osv_aliases | select('match', '^GHSA-') | list)) | unique }}
+
+    - name: Query OSV for each advisory
+      ansible.builtin.uri:
+        url: "https://api.osv.dev/v1/vulns/{{ item }}"
+        return_content: true
+        timeout: "{{ http_timeout }}"
+      loop: "{{ osv_ids }}"
+      register: osv_resp
+      failed_when: false
+
+    - name: Collect OSV affected-package entries
+      ansible.builtin.set_fact:
+        osv_affected: >-
+          {{ osv_resp.results | default([])
+             | selectattr('status', 'defined') | selectattr('status', 'eq', 200)
+             | map(attribute='json') | map(attribute='affected', default=[])
+             | flatten(levels=1) | list }}
+
+    - name: Build package URLs (highest affected version) and fixed versions from OSV
+      ansible.builtin.set_fact:
+        pkg_purls: "{{ pkg_purls + [item.package.purl ~ at_version] }}"
+        pkg_fixed: >-
+          {{ pkg_fixed
+             + (item.ranges | default([]) | map(attribute='events') | flatten(levels=1)
+                | selectattr('fixed', 'defined') | map(attribute='fixed')
+                | map('regex_replace', '^', item.package.name ~ '@') | list) }}
+      vars:
+        # OSV lists versions in text order (1.9.1 sorts after 1.24.1), so pick the max by
+        # version comparison. PEP 440 for PyPI; other ecosystems keep OSV's last entry.
+        at_version: >-
+          {%- set ns = namespace(v='') -%}
+          {%- if item.package.ecosystem | default('') == 'PyPI' -%}
+          {%- for x in item.versions | default([]) -%}
+          {%- if ns.v == '' or x is version(ns.v, '>', version_type='pep440') -%}{%- set ns.v = x -%}{%- endif -%}
+          {%- endfor -%}
+          {%- else -%}
+          {%- set ns.v = item.versions | default([]) | last | default('') -%}
+          {%- endif -%}
+          {{ ('@' ~ ns.v) if ns.v | length > 0 else '' }}
+      loop: "{{ osv_affected }}"
+      loop_control:
+        label: "{{ item.package.name | default('?') }}"
+      when: item.package.purl is defined
+
+    - name: Collect vulnerable ranges and first patched versions from GitHub
+      ansible.builtin.set_fact:
+        ghsa_ranges: "{{ ghsa_ranges + [item.package.name ~ ' ' ~ item.vulnerable_version_range | default('')] }}"
+        pkg_fixed: "{{ pkg_fixed + ([item.package.name ~ '@' ~ fpv] if fpv | length > 0 else []) }}"
+      vars:
+        fpv: >-
+          {{ (((item.first_patched_version | default('')).identifier | default(''))
+              if (item.first_patched_version | default('')) is mapping
+              else (item.first_patched_version | default('', true))) | string }}
+      loop: "{{ src_ghsa | map(attribute='vulnerabilities', default=[]) | flatten(levels=1) | list }}"
+      loop_control:
+        label: "{{ item.package.name | default('?') }}"
+      when: item.package.name is defined
+
+    # ---------------------------------------------------- RHEL / OS packages
+    - name: Red Hat fixed releases - RPM purls, CPEs and advisories
+      ansible.builtin.set_fact:
+        rh_purls: >-
+          {{ rh_purls
+             + (['pkg:rpm/redhat/' ~ nevr[0] ~ '@' ~ nevr[2] ~ '-' ~ nevr[3]
+                 ~ (('?epoch=' ~ nevr[1]) if nevr[1] not in ['', '0'] else '')]
+                if nevr | length == 4 else []) }}
+        rh_cpes: "{{ rh_cpes + ([item.cpe] if item.cpe is defined else []) }}"
+        rh_advisories: >-
+          {{ rh_advisories + [{'product': item.product_name | default(''),
+                               'advisory': item.advisory | default(''),
+                               'package': item.package | default(''),
+                               'release_date': item.release_date | default('')}] }}
+      vars:
+        # NEVR: openssl-1:3.0.7-27.el9 -> [name, epoch, version, release]
+        nevr: >-
+          {{ item.package | default('')
+             | regex_findall('^(.+)-(?:([0-9]+):)?([^-]+)-([^-]+)$') | first | default([]) }}
+        rh_keep: >-
+          {{ rh_product_filter | length == 0
+             or (rh_product_filter | select('in', item.product_name | default('')) | list | length > 0) }}
+      loop: "{{ src_rh.affected_release | default([]) }}"
+      loop_control:
+        label: "{{ item.product_name | default('?') }}"
+      when: rh_keep | bool
+
+    - name: Red Hat product fix state (affected / not affected / will not fix)
+      ansible.builtin.set_fact:
+        rh_product_status: >-
+          {{ rh_product_status + [{'product': item.product_name | default(''),
+                                   'package': item.package_name | default(''),
+                                   'fix_state': item.fix_state | default('')}] }}
+      vars:
+        rh_keep: >-
+          {{ rh_product_filter | length == 0
+             or (rh_product_filter | select('in', item.product_name | default('')) | list | length > 0) }}
+      loop: "{{ src_rh.package_state | default([]) }}"
+      loop_control:
+        label: "{{ item.product_name | default('?') }}"
+      when: rh_keep | bool
+
+    # ------------------------------------------------------------------ CVSS
+    # Order matters: the first entry becomes the headline cvss_score.
+    # Vendor (Red Hat) > CNA > ADP > NVD > GitHub.
+    - name: CVSS - Red Hat
+      ansible.builtin.set_fact:
+        cvss_list: >-
+          {{ cvss_list + [{'source': 'Red Hat', 'type': 'Vendor',
+                           'version': vec[5:8] if vec is match('^CVSS:') else '3.0',
+                           'score': src_rh.cvss3.cvss3_base_score | float,
+                           'vector': vec,
+                           'severity': src_rh.threat_severity | default('')}] }}
+      vars:
+        vec: "{{ src_rh.cvss3.cvss3_scoring_vector | default('') }}"
+      when: src_rh.cvss3.cvss3_base_score is defined
+
+    - name: CVSS - CVE.org CNA and ADP containers
+      ansible.builtin.set_fact:
+        cvss_list: >-
+          {{ cvss_list + [{'source': item.0.providerMetadata.shortName | default(item.0._role),
+                           'type': item.0._role,
+                           'version': m.version | default('') | string,
+                           'score': m.baseScore | float,
+                           'vector': m.vectorString | default(''),
+                           'severity': m.baseSeverity | default('')}] }}
+      vars:
+        cvss_key: "{{ ['cvssV4_0', 'cvssV3_1', 'cvssV3_0', 'cvssV2_0'] | select('in', item.1) | first | default('') }}"
+        m: "{{ item.1[cvss_key] if cvss_key | length > 0 else {} }}"
+      loop: >-
+        {{ ([src_cna | combine({'_role': 'CNA'})] + (src_adp | map('combine', {'_role': 'ADP'}) | list))
+           | subelements('metrics', skip_missing=true) }}
+      loop_control:
+        label: "{{ item.0.providerMetadata.shortName | default('?') }}"
+      when: cvss_key | length > 0
+
+    - name: CVSS - NVD (Primary always; Secondary only if not already listed)
+      ansible.builtin.set_fact:
+        cvss_list: >-
+          {{ cvss_list + [{'source': 'NVD' if item.source | default('') == 'nvd@nist.gov' else item.source | default('NVD'),
+                           'type': item.type | default(''),
+                           'version': item.cvssData.version | default('') | string,
+                           'score': item.cvssData.baseScore | float,
+                           'vector': item.cvssData.vectorString | default(''),
+                           'severity': item.cvssData.baseSeverity | default(item.baseSeverity | default(''))}] }}
+      loop: >-
+        {{ ['cvssMetricV40', 'cvssMetricV31', 'cvssMetricV30', 'cvssMetricV2']
+           | select('in', src_nvd.metrics | default({}))
+           | map('extract', src_nvd.metrics | default({}))
+           | flatten(levels=1) | sort(attribute='type') }}
+      loop_control:
+        label: "{{ item.source | default('?') }} {{ item.cvssData.version | default('') }}"
+      when: >-
+        item.type | default('Primary') == 'Primary'
+        or item.cvssData.vectorString | default('') not in (cvss_list | map(attribute='vector') | list)
+
+    - name: CVSS - GitHub advisories (only if vector not already listed)
+      ansible.builtin.set_fact:
+        cvss_list: >-
+          {{ cvss_list + [{'source': 'GitHub', 'type': 'GHSA',
+                           'version': s.vector_string[5:8] if s.vector_string | default('') is match('^CVSS:') else '',
+                           'score': s.score | float,
+                           'vector': s.vector_string | default(''),
+                           'severity': item.0.severity | default('')}] }}
+      vars:
+        s: >-
+          {{ (item.0.cvss_severities | default({}))[item.1]
+             | default(item.0.cvss | default({}) if item.1 == 'cvss_v3' else {}) }}
+      loop: "{{ src_ghsa | product(['cvss_v4', 'cvss_v3']) | list }}"
+      loop_control:
+        label: "{{ item.0.ghsa_id }} {{ item.1 }}"
+      when:
+        - (s.score | default(0, true) | float) > 0
+        - s.vector_string | default('') not in (cvss_list | map(attribute='vector') | list)
+
+    # ------------------------------------------------------------- derive
+    - name: Derive CPEs, references, CWEs and CISA ADP data
+      ansible.builtin.set_fact:
+        all_cpes: >-
+          {{ ((src_nvd.configurations | default([])
+               | map(attribute='nodes', default=[]) | flatten(levels=1)
+               | map(attribute='cpeMatch', default=[]) | flatten(levels=1)
+               | selectattr('vulnerable', 'defined') | selectattr('vulnerable')
+               | map(attribute='criteria') | list)
+             + (([src_cna] + src_adp)
+               | map(attribute='affected', default=[]) | flatten(levels=1)
+               | map(attribute='cpes', default=[]) | flatten(levels=1) | list)
+             + rh_cpes)
+             | unique }}
+        all_refs: >-
+          {{ ((src_cna.references | default([]) | map(attribute='url') | list)
+             + (src_ghsa | map(attribute='references', default=[]) | flatten(levels=1) | list)
+             + (src_nvd.references | default([]) | map(attribute='url') | list))
+             | unique }}
+        all_cwes: >-
+          {{ ((src_ghsa | map(attribute='cwes', default=[]) | flatten(levels=1)
+               | map(attribute='cwe_id', default='') | list)
+             + (src_nvd.weaknesses | default([]) | map(attribute='description', default=[])
+               | flatten(levels=1) | map(attribute='value', default='') | list)
+             + (src_cna.problemTypes | default([]) | map(attribute='descriptions', default=[])
+               | flatten(levels=1) | map(attribute='cweId', default='') | list)
+             + ([src_rh.cwe] if src_rh.cwe is defined else []))
+             | select('match', '^CWE-[0-9]+$') | unique }}
+        adp_other: >-
+          {{ src_adp | map(attribute='metrics', default=[]) | flatten(levels=1)
+             | selectattr('other', 'defined') | map(attribute='other') | list }}
+
+    - name: Determine ecosystem, repository, KEV and SSVC
+      ansible.builtin.set_fact:
+        eco: >-
+          {{ osv_affected[0].package.ecosystem
+               if osv_affected | length > 0 and osv_affected[0].package.ecosystem is defined
+             else (ghsa_ecosystem_map[src_ghsa[0].vulnerabilities[0].package.ecosystem]
+                     | default(src_ghsa[0].vulnerabilities[0].package.ecosystem)
+                   if src_ghsa | length > 0 and src_ghsa[0].vulnerabilities | default([]) | length > 0
+             else ('Red Hat'
+                   if (src_rh.affected_release | default([]) + src_rh.package_state | default([])) | length > 0
+             else ('CPE (' ~ (cpe_part_names[all_cpes[0].split(':')[2]] | default('unknown')) ~ ')'
+                   if all_cpes | length > 0 and all_cpes[0] is match('^cpe:2[.]3:')
+             else 'unknown'))) }}
+        repo_url: >-
+          {{ ((src_ghsa | map(attribute='source_code_location', default='') | select | list)
+             + (all_refs
+                | select('match', '^https://(github[.]com|gitlab[.]com|bitbucket[.]org)/[^/]+/[^/#?]+')
+                | reject('match', '^https://github[.]com/advisories/')
+                | map('regex_replace', '^(https://[^/]+/[^/]+/[^/#?]+).*$', '\\1')
+                | map('regex_replace', '[.]git$', '')
+                | list))
+             | first | default('') }}
+        kev_adp: "{{ adp_other | selectattr('type', 'eq', 'kev') | map(attribute='content') | first | default({}) }}"
+        ssvc_opts: >-
+          {{ {} | combine(adp_other | selectattr('type', 'eq', 'ssvc') | map(attribute='content')
+                          | map(attribute='options', default=[]) | first | default([])) }}
+
+    # ------------------------------------------------------------- assemble
+    - name: Assemble CVE record
+      ansible.builtin.set_fact:
+        cve_record:
+          cve_id: "{{ cve }}"
+          title: >-
+            {{ [src_cna.title | default(''),
+                src_ghsa | map(attribute='summary', default='') | first | default(''),
+                src_rh.bugzilla.description | default('')]
+               | select | first | default('') | trim }}
+          description: >-
+            {{ [src_cna.descriptions | default([]) | selectattr('lang', 'match', '^en')
+                  | map(attribute='value') | first | default(''),
+                src_cna.rejectedReasons | default([]) | map(attribute='value') | first | default(''),
+                src_nvd.descriptions | default([]) | selectattr('lang', 'match', '^en')
+                  | map(attribute='value') | first | default(''),
+                src_ghsa | map(attribute='description', default='') | first | default(''),
+                src_rh.details | default([]) | first | default('')]
+               | select | first | default('') | trim }}
+          ecosystem: "{{ eco }}"
+          purls: "{{ (pkg_purls + rh_purls) | unique }}"
+          cpes: "{{ all_cpes }}"
+          repository_url: "{{ repo_url }}"
+          references: "{{ all_refs }}"
+          affected_manifest_files: "{{ manifest_files_by_ecosystem[eco] | default([]) }}"
+          state: "{{ cve_state }}"
+          published: >-
+            {{ src_cveorg.cveMetadata.datePublished | default(src_nvd.published | default(''), true) }}
+          cwes: "{{ all_cwes }}"
+          # headline score = first entry of `cvss` (vendor-preferred); full list keeps every source
+          cvss_score: "{{ cvss_list[0].score if cvss_list | length > 0 else none }}"
+          cvss_score_source: "{{ cvss_list[0].source if cvss_list | length > 0 else '' }}"
+          severity: >-
+            {{ [cvss_list[0].severity if cvss_list | length > 0 else '',
+                src_ghsa | map(attribute='severity', default='') | first | default(''),
+                src_rh.threat_severity | default('')]
+               | select | first | default('') | upper }}
+          cvss: "{{ cvss_list | unique }}"
+          exploitation:
+            kev: "{{ src_nvd.cisaExploitAdd is defined or kev_adp | length > 0 }}"
+            kev_date_added: "{{ src_nvd.cisaExploitAdd | default(kev_adp.dateAdded | default('')) }}"
+            kev_due_date: "{{ src_nvd.cisaActionDue | default('') }}"
+            kev_required_action: "{{ src_nvd.cisaRequiredAction | default('') }}"
+            ssvc_exploitation: "{{ ssvc_opts.Exploitation | default('') }}"
+            ssvc_automatable: "{{ ssvc_opts.Automatable | default('') }}"
+            ssvc_technical_impact: "{{ ssvc_opts['Technical Impact'] | default('') }}"
+            epss: "{{ src_epss.epss | float if src_epss.epss is defined else none }}"
+            epss_percentile: "{{ src_epss.percentile | float if src_epss.percentile is defined else none }}"
+            epss_date: "{{ src_epss.date | default('') }}"
+          vendor_notes:
+            red_hat_statement: "{{ src_rh.statement | default('') | trim }}"
+            red_hat_mitigation: >-
+              {{ (((src_rh.mitigation | default('')).value | default(''))
+                  if (src_rh.mitigation | default('')) is mapping
+                  else (src_rh.mitigation | default('', true))) | string | trim }}
+            cna_workarounds: >-
+              {{ src_cna.workarounds | default([]) | selectattr('lang', 'match', '^en')
+                 | map(attribute='value') | list }}
+            cna_configurations: >-
+              {{ src_cna.configurations | default([]) | selectattr('lang', 'match', '^en')
+                 | map(attribute='value') | list }}
+          remediation:
+            fixed_versions: "{{ pkg_fixed | unique }}"
+            vulnerable_ranges: "{{ ghsa_ranges | unique }}"
+            cna_solutions: >-
+              {{ src_cna.solutions | default([]) | selectattr('lang', 'match', '^en')
+                 | map(attribute='value') | list }}
+            red_hat_products_filter: "{{ rh_product_filter }}"
+            red_hat_advisories: "{{ rh_advisories | unique }}"
+            red_hat_product_status: "{{ rh_product_status | unique }}"
+          sources: >-
+            {{ [('cve.org' if src_cveorg else ''),
+                ('nvd' if src_nvd else ''),
+                ('github-advisory' if src_ghsa else ''),
+                ('osv' if osv_affected else ''),
+                ('red-hat' if src_rh else ''),
+                ('first-epss' if src_epss else '')]
+               | select | list }}
+
+    - name: Fail when no source knows this CVE
+      ansible.builtin.fail:
+        msg: >-
+          {{ cve }} was not found in CVE.org, NVD, GitHub Advisory Database or Red Hat
+          (or every source was unreachable from this host).
+      when: cve_record.sources | reject('eq', 'first-epss') | list | length == 0
+
+    # --------------------------------------------------------------- output
+    - name: Show CVE record
+      ansible.builtin.debug:
+        var: cve_record
+
+    - name: Publish record to downstream workflow nodes (AAP)
+      ansible.builtin.set_stats:
+        data:
+          cve_record: "{{ cve_record }}"
+
+    - name: Post to Slack
+      ansible.builtin.include_tasks: tasks/slack_notify.yml
+      vars:
+        slack_status: completed
+        slack_title: "{{ cve_record.cve_id }} - {{ cve_record.title }}"
+        slack_text: "{{ cve_record.description }}\n\nCheck the AAP job output for details.\nLink: https://myaap-ansible-automation-platform.apps.hub.lab.com/execution/jobs/playbook/{{ awx_job_id }}/output"
+        slack_new_thread: false
+        slack_broadcast: false
