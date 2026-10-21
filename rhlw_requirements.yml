@@ -58,6 +58,17 @@
     rhlw_pin_operator: "=="                           # operator for the CVE package
     rhlw_other_pin_operator: "=="                     # operator for every other package (kept at SBOM version)
 
+    # ---- rhlw approval / Slack message wording ----
+    rhlw_vendor_name: "Lightwell Security"            # header: "APPROVAL For <vendor>: <CVE> Backporting Fix"
+    rhlw_advisory_label: "CVE Advisor if"             # label before the vulnerable range
+    # Slack has no text colour. How the "Backporting Fix" line is highlighted in Slack:
+    #   emoji = marker emoji + whole line bold   e.g. 🔴 *Backporting Fix: flask 2.2.2 -> ==2.2.2-rhlw-00001*
+    #   code  = bold label + version in inline code (colour depends on the viewer's Slack theme)
+    #   bold  = whole line bold
+    #   plain = no formatting
+    rhlw_slack_highlight: emoji
+    rhlw_slack_marker: "🔴"                           # used by 'emoji'; ":red_circle:" also works if slack_text is mrkdwn
+
     # ---- upstream mode settings (rhlw: false) ----
     pypi_json_base: "https://pypi.org/pypi"
     version_compare_type: loose                       # 'pep440' if the packaging lib is in the EE
@@ -569,10 +580,42 @@
             {%- set _ = t.append('(' ~ (rng | map(attribute='op') | zip(rng | map(attribute='ver')) | map('join', ' ') | join(', ')) ~ ')') -%}
           {%- endfor -%}
           {{ t | join(' OR ') if t else (r.remediation.vulnerable_ranges | default(['unknown']) | join(' | ')) }}
+        # rhlw header style: "< 3.1.3" (no brackets) for a single range, "(>= 1.0, < 1.2) OR (...)" for several
+        ranges_text_rhlw: >-
+          {%- if vuln_ranges | length == 1 -%}
+            {{ vuln_ranges[0] | map(attribute='op') | zip(vuln_ranges[0] | map(attribute='ver')) | map('join', ' ') | join(', ') }}
+          {%- else -%}
+            {{ ranges_text }}
+          {%- endif -%}
       ansible.builtin.set_fact:
         requirements_approval: >-
           {%- set L = [] -%}
           {%- set rv = proposal.review -%}
+          {%- if rhlw | bool -%}
+          {#- ===== rhlw format ===== -#}
+          {%- set _ = L.append('APPROVAL For ' ~ rhlw_vendor_name ~ ': ' ~ (target_cve | default('n/a', true)) ~ ' Backporting Fix') -%}
+          {%- set _ = L.append('') -%}
+          {%- set _ = L.append(rhlw_advisory_label ~ ': ' ~ target_norm ~ ' ' ~ ranges_text_rhlw ~ ' | Fixed in: ' ~ (fixed_versions | join(', ') | default('unknown', true))) -%}
+          {%- set _ = L.append('') -%}
+          {%- set _ = L.append('SBOMs: ' ~ (rv | length)
+                ~ ' | Fix check PASS: ' ~ (rv | selectattr('cve_fix_check', 'equalto', 'PASS') | list | length)
+                ~ ', FAIL: ' ~ (rv | selectattr('cve_fix_check', 'equalto', 'FAIL') | list | length)
+                ~ ', other: ' ~ (rv | rejectattr('cve_fix_check', 'in', ['PASS', 'FAIL']) | list | length)
+                ~ ' | Release changes: ' ~ (rv | map(attribute='changes') | flatten | length)
+                ~ ' | Upgrade scope: ' ~ scope_label) -%}
+          {%- for i in rv -%}
+            {%- set _ = L.append('') -%}
+            {%- set _ = L.append('[' ~ loop.index ~ '] ' ~ i.sbom_name ~ ' (' ~ i.sbom_id ~ ')') -%}
+            {%- set _ = L.append('    File      : ' ~ i.requirements_file) -%}
+            {%- set _ = L.append('    Backporting Fix: '
+                  ~ ((target_norm ~ ' ' ~ (i.cve_installed | default('?', true)) ~ ' -> ' ~ cve_op ~ i.cve_proposed)
+                     if (i.cve_package_present and i.cve_proposed) else i.cve_fix_check)) -%}
+            {%- set _ = L.append('') -%}
+            {%- set _ = L.append('    Changes (' ~ (i.changes | length) ~ '):') -%}
+            {%- for c in i.changes -%}{%- set _ = L.append('      * ' ~ c) -%}{%- endfor -%}
+          {%- endfor -%}
+          {%- else -%}
+          {#- ===== upstream format (unchanged) ===== -#}
           {%- set _ = L.append('CVE APPROVAL REQUEST: ' ~ (target_cve | default('n/a', true)) ~ ' in ' ~ (target_norm | default('n/a', true))) -%}
           {%- set _ = L.append('Severity: ' ~ (r.severity | default('n/a')) ~ ' (CVSS ' ~ (r.cvss_score | default('n/a')) ~ ')'
                 ~ ' | KEV: ' ~ (r.exploitation.kev | default('n/a')) ~ ' | EPSS: ' ~ (r.exploitation.epss | default('n/a'))) -%}
@@ -596,6 +639,7 @@
               {%- set _ = L.append('    Not found on PyPI (kept at installed version): ' ~ (i.not_found_on_pypi | join(', '))) -%}
             {%- endif -%}
           {%- endfor -%}
+          {%- endif -%}
           {{ L | join(nl) }}
         requirements_content: >-
           {%- set L = [] -%}
@@ -642,11 +686,36 @@
           requirements_approval: "{{ requirements_approval }}"
           requirements_content: "{{ requirements_content }}"
 
+    # Slack copy of the approval message: in rhlw mode the "Backporting Fix" line is highlighted with mrkdwn
+    - name: Build Slack approval text
+      vars:
+        nl: "\n"
+      ansible.builtin.set_fact:
+        slack_approval_text: >-
+          {%- set key = 'Backporting Fix: ' -%}
+          {%- set out = [] -%}
+          {%- for l in requirements_approval.splitlines() -%}
+            {%- if rhlw | bool and l.strip().startswith(key) and rhlw_slack_highlight in ['emoji', 'code', 'bold'] -%}
+              {%- set indent = l[:(l | length) - (l.lstrip() | length)] -%}
+              {%- set value = l.strip()[key | length:] -%}
+              {%- if rhlw_slack_highlight == 'emoji' -%}
+                {%- set _ = out.append(indent ~ rhlw_slack_marker ~ ' *Backporting Fix: ' ~ value ~ '*') -%}
+              {%- elif rhlw_slack_highlight == 'code' -%}
+                {%- set _ = out.append(indent ~ '*Backporting Fix:* `' ~ value ~ '`') -%}
+              {%- else -%}
+                {%- set _ = out.append(indent ~ '*Backporting Fix: ' ~ value ~ '*') -%}
+              {%- endif -%}
+            {%- else -%}
+              {%- set _ = out.append(l) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ out | join(nl) }}
+
     - name: Post to Slack
       ansible.builtin.include_tasks: tasks/slack_notify.yml
       vars:
         slack_status: paused
         slack_title: "Wait for Approval{{ ' (rhlw)' if rhlw | bool else '' }}"
-        slack_text: "{{ requirements_approval }}\n\nCheck the AAP job output for details.\nLink: https://myaap-ansible-automation-platform.apps.hub.lab.com/execution/jobs/playbook/{{ awx_job_id }}/output"
+        slack_text: "{{ slack_approval_text }}\n\nCheck the AAP job output for details.\nLink: https://myaap-ansible-automation-platform.apps.hub.lab.com/execution/jobs/playbook/{{ awx_job_id }}/output"
         slack_new_thread: false
         slack_broadcast: false
