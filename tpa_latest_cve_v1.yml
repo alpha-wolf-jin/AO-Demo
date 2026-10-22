@@ -1,0 +1,251 @@
+---
+# RHTPA - get the latest CVE (native Ansible port of tpa-cve-list_v2.sh)
+#
+# Run:
+#   ansible-playbook -i inventory tpa_latest_cve.yml --ask-vault-pass
+#   (optional) -e sort_by=published     # newest by published date instead of highest CVE number
+#   (optional) -e top_n=20              # how many to show in the list
+#
+# "Latest" has two meanings - pick one with sort_by:
+#   id         highest CVE number: year, then sequence (CVE-2026-10967 > CVE-2026-9999). Same as the script.
+#   published  most recent published date (CVEs without a date go last)
+#
+# The script read one page (limit=100), so it could miss the latest CVE once TPA holds more.
+# This playbook reads every page (up to max_items) before sorting.
+#
+# Outputs (set_stats, for the next workflow node):
+#   tpa_latest_cve   {id, title, published}
+#   tpa_cve_list     top_n entries, newest first
+#   cve_id           the latest CVE id (only if publish_cve_id=true), so cve_lookup / seed nodes pick it up
+#
+# Secrets (vault file / AAP credential, never in plain vars or the script):
+#   rhtpa_client_secret      # preferred: secret of the rhtpa-cli client
+#   keycloak_admin_password  # only needed if rhtpa_client_secret is not supplied
+
+- name: Get latest CVE from RHTPA
+  hosts: all
+  gather_facts: false
+
+  vars:
+    proxy_url: ""
+    no_proxy_hosts: "{{ rhtpa_host }},{{ keycloak_host }},localhost,127.0.0.1"
+    rhtpa_host: server-trusted-profile-analyzer.apps.hub.lab.com
+    keycloak_host: keycloak-keycloak.apps.hub.lab.com
+    realm: rhtpa
+    client_id: rhtpa-cli
+    keycloak_admin_user: admin
+    validate_certs: false              # mirrors curl -k; set true once CA is trusted
+    hide_secrets: true
+
+    sort_by: id                        # id | published
+    cve_only: true                     # ignore non-CVE identifiers (GHSA-..., etc.)
+    page_size: 100
+    max_items: 10000                   # safety cap on how many vulnerabilities are read
+    top_n: 10
+    publish_cve_id: false              # true = also publish cve_id for downstream nodes
+    notify_slack: true
+
+  environment: >-
+    {{ {'https_proxy': proxy_url, 'http_proxy': proxy_url, 'no_proxy': no_proxy_hosts}
+       if proxy_url | length > 0 else {} }}
+
+  tasks:
+    - name: Check inputs
+      ansible.builtin.assert:
+        that:
+          - sort_by in ['id', 'published']
+          - (rhtpa_client_secret | default('') | length > 0) or (keycloak_admin_password | default('') | length > 0)
+        fail_msg: >-
+          sort_by must be 'id' or 'published', and rhtpa_client_secret or keycloak_admin_password
+          must be supplied (attach the Keycloak credential / vault file).
+        quiet: true
+
+    # ---------- 1. OIDC token ----------
+    - name: Look up client secret via Keycloak admin (only if not supplied)
+      when: rhtpa_client_secret | default('') | length == 0
+      no_log: "{{ hide_secrets }}"
+      block:
+        - name: Admin token (master realm)
+          ansible.builtin.uri:
+            url: "https://{{ keycloak_host }}/realms/master/protocol/openid-connect/token"
+            method: POST
+            body_format: form-urlencoded
+            body:
+              grant_type: password
+              client_id: admin-cli
+              username: "{{ keycloak_admin_user }}"
+              password: "{{ keycloak_admin_password }}"
+            validate_certs: "{{ validate_certs }}"
+          register: admin_tok
+
+        - name: Find client UUID
+          ansible.builtin.uri:
+            url: "https://{{ keycloak_host }}/admin/realms/{{ realm }}/clients?clientId={{ client_id }}"
+            headers: { Authorization: "Bearer {{ admin_tok.json.access_token }}" }
+            validate_certs: "{{ validate_certs }}"
+          register: client_lookup
+          failed_when: >-
+            client_lookup.status != 200 or client_lookup.json is not defined
+            or client_lookup.json is not sequence or client_lookup.json | length == 0
+
+        - name: Read client secret
+          ansible.builtin.uri:
+            url: "https://{{ keycloak_host }}/admin/realms/{{ realm }}/clients/{{ client_lookup.json[0].id }}/client-secret"
+            headers: { Authorization: "Bearer {{ admin_tok.json.access_token }}" }
+            validate_certs: "{{ validate_certs }}"
+          register: secret_lookup
+
+        - name: Store client secret
+          ansible.builtin.set_fact:
+            rhtpa_client_secret: "{{ secret_lookup.json.value }}"
+
+    - name: Get RHTPA bearer token (client_credentials)
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_host }}/realms/{{ realm }}/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          grant_type: client_credentials
+          client_id: "{{ client_id }}"
+          client_secret: "{{ rhtpa_client_secret }}"
+        validate_certs: "{{ validate_certs }}"
+      register: rhtpa_tok
+      no_log: "{{ hide_secrets }}"
+
+    - name: Set auth header
+      ansible.builtin.set_fact:
+        rhtpa_headers:
+          Authorization: "Bearer {{ rhtpa_tok.json.access_token }}"
+          Accept: application/json
+      no_log: "{{ hide_secrets }}"
+
+    # ---------- 2. Fetch every page ----------
+    - name: Fetch first page of vulnerabilities
+      ansible.builtin.uri:
+        url: "https://{{ rhtpa_host }}/api/v3/vulnerability?offset=0&limit={{ page_size }}"
+        headers: "{{ rhtpa_headers }}"
+        validate_certs: "{{ validate_certs }}"
+        return_content: true
+      register: tpa_page1
+      failed_when: tpa_page1.status != 200 or tpa_page1.json is not defined or tpa_page1.json is not mapping
+
+    - name: Work out how many more pages to read
+      ansible.builtin.set_fact:
+        tpa_total: "{{ tpa_total_n }}"
+        tpa_total_known: "{{ tpa_page1.json.total is defined }}"
+        tpa_offsets: "{{ range(page_size | int, [tpa_total_n | int, max_items | int] | min, page_size | int) | list }}"
+      vars:
+        # use the API's total when present; otherwise assume one page
+        tpa_total_n: "{{ tpa_page1.json.total | default(tpa_page1.json['items'] | default([]) | length) | int }}"
+
+    - name: Fetch remaining pages
+      ansible.builtin.uri:
+        url: "https://{{ rhtpa_host }}/api/v3/vulnerability?offset={{ item }}&limit={{ page_size }}"
+        headers: "{{ rhtpa_headers }}"
+        validate_certs: "{{ validate_certs }}"
+        return_content: true
+      loop: "{{ tpa_offsets }}"
+      loop_control:
+        label: "offset {{ item }}"
+      register: tpa_pages
+
+    - name: Combine all pages
+      ansible.builtin.set_fact:
+        tpa_items: >-
+          {{ (tpa_page1.json['items'] | default([]))
+             + (tpa_pages.results | default([]) | selectattr('json', 'defined')
+                | map(attribute='json') | map(attribute='items', default=[]) | flatten(levels=1) | list) }}
+
+    # ---------- 3. Sort ----------
+    # Keys are built as strings so they sort correctly:
+    #   id        -> zero-padded "YYYY" + "NNNNNNNNNNNN" (numeric order, not text order)
+    #   published -> ISO-8601 timestamp (text order = time order); missing dates sort last
+    - name: Sort vulnerabilities newest first
+      ansible.builtin.set_fact:
+        tpa_sorted_raw: >-
+          {%- set out = [] -%}
+          {%- for i in tpa_items -%}
+            {%- set ident = (i.identifier | default('')) | string -%}
+            {%- set parts = ident.split('-') -%}
+            {%- set is_cve = parts | length == 3 and parts[0] | upper == 'CVE'
+                             and parts[1] is match('^[0-9]{4}$') and parts[2] is match('^[0-9]+$') -%}
+            {%- if is_cve or not cve_only | bool -%}
+              {%- if sort_by == 'published' -%}
+                {%- set key = (i.published | default('', true)) | string -%}
+              {%- elif is_cve -%}
+                {%- set key = '%04d%012d' | format(parts[1] | int, parts[2] | int) -%}
+              {%- else -%}
+                {%- set key = '' -%}
+              {%- endif -%}
+              {%- set _ = out.append({'id': ident, 'title': i.title | default(''),
+                                      'published': i.published | default(''), '_key': key}) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ out | sort(attribute='_key', reverse=true) | to_json }}
+
+    - name: Normalise sorted list
+      ansible.builtin.set_fact:
+        tpa_sorted: >-
+          {{ (tpa_sorted_raw | from_json if tpa_sorted_raw is string else tpa_sorted_raw)
+             | map('dict2items') | map('rejectattr', 'key', 'eq', '_key') | map('items2dict') | list }}
+
+    - name: Fail if TPA returned no CVEs
+      ansible.builtin.fail:
+        msg: >-
+          TPA returned {{ tpa_items | length }} vulnerabilities but none
+          {{ 'with a CVE identifier' if cve_only | bool else '' }}. Check the API response.
+      when: tpa_sorted | length == 0
+
+    - name: Set latest CVE
+      ansible.builtin.set_fact:
+        tpa_latest_cve: "{{ tpa_sorted[0] }}"
+        tpa_cve_list: "{{ tpa_sorted[: top_n | int] }}"
+
+    # ---------- 4. Output ----------
+    - name: Show latest CVE
+      ansible.builtin.debug:
+        msg:
+          - "Latest CVE  : {{ tpa_latest_cve.id }}   (sorted by {{ 'CVE number' if sort_by == 'id' else 'published date' }})"
+          - "Title       : {{ tpa_latest_cve.title | default('n/a', true) }}"
+          - "Published   : {{ tpa_latest_cve.published | default('n/a', true) }}"
+          - "Read        : {{ tpa_items | length }} of {{ tpa_total }} vulnerabilities in TPA ({{ tpa_sorted | length }} {{ 'CVEs' if cve_only | bool else 'entries' }})"
+
+    - name: Show top {{ top_n }} CVEs
+      ansible.builtin.debug:
+        msg: >-
+          {{ tpa_cve_list | map(attribute='id')
+             | zip(tpa_cve_list | map(attribute='published', default='') | map('default', 'no date', true),
+                   tpa_cve_list | map(attribute='title', default='') | map('truncate', 80))
+             | map('join', '  |  ') | list }}
+
+    - name: Warn if the safety cap stopped reading early
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: TPA reports {{ tpa_total }} vulnerabilities but only {{ tpa_items | length }} were read
+          (max_items={{ max_items }}). Raise max_items, or the latest CVE may be missed.
+      when: tpa_items | length < tpa_total | int
+
+    - name: Warn if TPA did not report a total
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: TPA did not return 'total', so only the first page ({{ page_size }}) was read.
+          Raise page_size (e.g. -e page_size=10000) to be sure the latest CVE is included.
+      when:
+        - not tpa_total_known | bool
+        - tpa_items | length >= page_size | int
+
+    - name: Publish result to downstream workflow nodes
+      ansible.builtin.set_stats:
+        data: >-
+          {{ {'tpa_latest_cve': tpa_latest_cve, 'tpa_cve_list': tpa_cve_list}
+             | combine({'cve_id': tpa_latest_cve.id} if publish_cve_id | bool else {}) }}
+
+    - name: Post to Slack
+      ansible.builtin.include_tasks: tasks/slack_notify.yml
+      when: notify_slack | bool
+      vars:
+        slack_status: completed
+        slack_title: "Latest CVE in TPA: {{ tpa_latest_cve.id }}"
+        slack_text: "{{ tpa_latest_cve.title | default('', true) }}\nPublished: {{ tpa_latest_cve.published | default('n/a', true) }}\n\nCheck the AAP job output for details.\nLink: https://myaap-ansible-automation-platform.apps.hub.lab.com/execution/jobs/playbook/{{ awx_job_id | default('n/a') }}/output"
+        slack_new_thread: false
+        slack_broadcast: false
