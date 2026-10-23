@@ -1,0 +1,53 @@
+---
+# Pager for RHTPA list endpoints.
+# RHTPA returns "total": null, so the number of pages is unknown up front. This file keeps
+# requesting offset += page_size until a page comes back with fewer than page_size items.
+#
+# Inputs : _pg_url (endpoint without offset/limit), _pg_key (name to store the result under),
+#          page_size, rhtpa_headers, validate_certs, pager_max_items (default 20000)
+# Outputs: tpa_paged[_pg_key]       list of all items
+#          tpa_paged_meta[_pg_key]  {items, pages, status, complete}
+#            complete=false means pager_max_items stopped the paging or a request failed.
+
+- name: "Fetch {{ _pg_label | default(_pg_key) }} (offset {{ _pg_offset | default(0) }})"
+  ansible.builtin.uri:
+    url: "{{ _pg_url }}{{ '&' if '?' in _pg_url else '?' }}offset={{ _pg_offset | default(0) }}&limit={{ page_size }}"
+    headers: "{{ rhtpa_headers }}"
+    validate_certs: "{{ validate_certs }}"
+    return_content: true
+  register: _pg_resp
+  failed_when: false
+  no_log: true                         # pages are large; status is reported in tpa_paged_meta
+
+- name: "Collect page (offset {{ _pg_offset | default(0) }})"
+  ansible.builtin.set_fact:
+    _pg_acc: "{{ (_pg_acc if (_pg_offset | default(0) | int) > 0 else []) + _pg_page }}"
+    _pg_status: "{{ _pg_resp.status | default(-1) }}"
+    _pg_pages: "{{ ((_pg_offset | default(0) | int) // (page_size | int)) + 1 }}"
+    _pg_next_offset: "{{ (_pg_offset | default(0) | int) + (page_size | int) }}"
+    _pg_full: "{{ _pg_resp.status | default(-1) == 200 and _pg_page | length >= page_size | int }}"
+    _pg_capped: >-
+      {{ _pg_resp.status | default(-1) == 200 and _pg_page | length >= page_size | int
+         and ((_pg_offset | default(0) | int) + (page_size | int)) >= (pager_max_items | default(20000) | int) }}
+  vars:
+    _pg_body: "{{ _pg_resp.json | default([]) }}"
+    _pg_page: >-
+      {{ (_pg_body['items'] | default([])) if _pg_body is mapping
+         else (_pg_body if (_pg_body is sequence and _pg_body is not string) else []) }}
+  no_log: true
+
+- name: Fetch next page
+  ansible.builtin.include_tasks: tpa_paged_get.yml
+  vars:
+    _pg_offset: "{{ _pg_next_offset }}"   # computed in the previous task; must not reference _pg_offset itself
+  when:
+    - _pg_full | bool
+    - not _pg_capped | bool
+
+- name: "Store {{ _pg_label | default(_pg_key) }}"
+  ansible.builtin.set_fact:
+    tpa_paged: "{{ tpa_paged | default({}) | combine({_pg_key: _pg_acc}) }}"
+    tpa_paged_meta: >-
+      {{ tpa_paged_meta | default({}) | combine({_pg_key: {'items': _pg_acc | length, 'pages': _pg_pages | int,
+           'status': _pg_status | int, 'complete': (_pg_status | int == 200) and not (_pg_capped | bool)}}) }}
+  no_log: true

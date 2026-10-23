@@ -1,0 +1,511 @@
+---
+# RHTPA - Retrospective inventory impact audit (native Ansible port of check_cve_impact_pure.sh)
+#
+# Run:
+#   AAP workflow: the previous (CVE triage) node publishes `cve_record` with set_stats.
+#   Manual:       ansible-playbook -i inventory check_cve_impact.yml -e @cve_record.yml
+#                 ansible-playbook -i inventory check_cve_impact.yml -e cve_id=CVE-2023-45803   (no record: OSV lookup)
+#
+# Inputs (first one found wins):
+#   CVE id          : cve_id  ->  cve_record.cve_id
+#   Package name    : cve_package (explicit override, e.g. the AI's library_name)
+#                     -> cve_record.purls (pkg:pypi/<name>@...)
+#                     -> cve_record.remediation.fixed_versions / vulnerable_ranges (ecosystem PyPI only)
+#                     -> OSV -> RHTPA vulnerability title -> fallback_registry
+#   Vulnerable test : cve_record.remediation.vulnerable_ranges (e.g. "aiohttp >= 1.0.5, < 3.9.2")
+#                     -> single fixed version ("< fixed")
+#                     -> OSV affected version list
+#                     -> unknown: every version of the package is flagged
+#
+# Secrets (AAP custom credential, same one as seed_cve.yml):
+#   keycloak_admin_password  # used to look up the rhtpa-cli client secret
+#   rhtpa_client_secret      # optional alternative; if set, Keycloak admin is not used
+#
+# Result:
+#   - set_stats publishes vulnerable_sboms and cve_impact_* vars for downstream workflow nodes.
+
+- name: Audit stored SBOMs in RHTPA for a CVE
+  hosts: all
+  gather_facts: false
+
+  vars:
+    cve_id: ""
+    cve_record: {}                     # full record from the CVE triage node (dict, or JSON string)
+    cve_package: ""                    # optional override of the package name
+    version_compare_type: loose        # Ansible version test type; 'pep440' if the packaging lib is in the EE
+
+    proxy_url: ""
+    rhtpa_host: server-trusted-profile-analyzer.apps.hub.lab.com
+    keycloak_host: keycloak-keycloak.apps.hub.lab.com
+    realm: rhtpa
+    client_id: rhtpa-cli
+    keycloak_admin_user: admin
+    validate_certs: false
+    hide_secrets: true
+    fail_on_affected: true
+    # RHTPA list APIs are paginated; without a limit only the first page is returned
+    page_size: 100                     # items per request; all pages are fetched, so this only affects request count
+    pager_max_items: 20000             # safety cap per list (SBOMs, or packages in one SBOM)
+
+    # Download vulnerable SBOMs to the bastion
+    download_sboms: true
+    sbom_download_dir: "/var/tmp/rhtpa-sboms"          # files land in <dir>/<cve_id>/
+    sbom_download_path: "/api/v3/sbom/{id}/download"   # {id} is replaced with the SBOM id
+
+    # Last-resort package mapping, used only if the record, OSV and RHTPA all give no package name
+    fallback_registry:
+      CVE-2020-28493: jinja2
+      CVE-2019-11324: urllib3
+      CVE-2023-45803: urllib3
+      CVE-2024-23334: aiohttp
+
+  environment: "{{ {'https_proxy': proxy_url, 'http_proxy': proxy_url} if proxy_url | length > 0 else {} }}"
+
+  tasks:
+    # ---------- 0. Inputs from cve_record ----------
+    - name: Read inputs from cve_record
+      vars:
+        rec: >-
+          {{ (cve_record | from_json) if (cve_record is string and cve_record | trim | length > 0)
+             else (cve_record if cve_record is mapping else {}) }}
+        from_purl: >-
+          {{ rec.purls | default([]) | select('match', '^pkg:pypi/')
+             | map('regex_replace', '^pkg:pypi/', '') | map('regex_replace', '[@?#].*$', '') | list }}
+        from_fixed: >-
+          {{ rec.remediation.fixed_versions | default([]) | select('match', '^[A-Za-z0-9._-]+@')
+             | map('regex_replace', '@.*$', '') | list }}
+        from_range: >-
+          {{ rec.remediation.vulnerable_ranges | default([]) | select('match', '^[A-Za-z0-9._-]+\s*[<>=!~]')
+             | map('regex_replace', '\s*[<>=!~].*$', '') | list }}
+        pypi_eco: "{{ (rec.ecosystem | default('') | lower) == 'pypi' }}"
+        found: >-
+          {{ (from_purl if from_purl else (from_fixed + from_range if pypi_eco else []))
+             | map('lower') | map('regex_replace', '[-_.]+', '-') | unique | list }}
+      ansible.builtin.set_fact:
+        rec_data: "{{ rec }}"
+        target_cve: "{{ cve_id if cve_id | length > 0 else (rec.cve_id | default('')) }}"
+        record_pkg: "{{ found | first | default('') }}"
+        record_pkg_all: "{{ found }}"
+        record_pkg_source: "{{ 'cve_record purl' if from_purl else ('cve_record remediation' if found else '') }}"
+
+    - name: Validate input
+      ansible.builtin.assert:
+        that: target_cve is match('^CVE-\d{4}-\d{4,}$')
+        fail_msg: "No valid CVE id: pass cve_record (from the triage node) or -e cve_id=CVE-2023-45803"
+
+    - name: Warn when cve_id and cve_record disagree
+      ansible.builtin.debug:
+        msg: "WARNING: cve_id={{ cve_id }} but cve_record.cve_id={{ rec_data.cve_id }} - using {{ target_cve }}"
+      when:
+        - cve_id | length > 0
+        - rec_data.cve_id is defined
+        - rec_data.cve_id != cve_id
+
+    - name: Check that a secret was supplied
+      ansible.builtin.assert:
+        that: >-
+          (rhtpa_client_secret | default('') | length > 0) or
+          (keycloak_admin_password | default('') | length > 0)
+        fail_msg: >-
+          Neither rhtpa_client_secret nor keycloak_admin_password reached the playbook.
+          Check the custom credential is attached to the job template.
+        quiet: true
+
+    # ---------- 1. OIDC token ----------
+    - name: Look up client secret via Keycloak admin (only if not supplied)
+      when: rhtpa_client_secret | default('') | length == 0
+      no_log: "{{ hide_secrets }}"
+      block:
+        - name: Admin token (master realm)
+          ansible.builtin.uri:
+            url: "https://{{ keycloak_host }}/realms/master/protocol/openid-connect/token"
+            method: POST
+            body_format: form-urlencoded
+            body:
+              grant_type: password
+              client_id: admin-cli
+              username: "{{ keycloak_admin_user }}"
+              password: "{{ keycloak_admin_password }}"
+            validate_certs: "{{ validate_certs }}"
+          register: admin_tok
+
+        - name: Find client UUID
+          ansible.builtin.uri:
+            url: "https://{{ keycloak_host }}/admin/realms/{{ realm }}/clients?clientId={{ client_id }}"
+            headers: { Authorization: "Bearer {{ admin_tok.json.access_token }}" }
+            validate_certs: "{{ validate_certs }}"
+          register: client_lookup
+
+        - name: Read client secret
+          ansible.builtin.uri:
+            url: "https://{{ keycloak_host }}/admin/realms/{{ realm }}/clients/{{ client_lookup.json[0].id }}/client-secret"
+            headers: { Authorization: "Bearer {{ admin_tok.json.access_token }}" }
+            validate_certs: "{{ validate_certs }}"
+          register: secret_lookup
+
+        - name: Store client secret
+          ansible.builtin.set_fact:
+            rhtpa_client_secret: "{{ secret_lookup.json.value }}"
+
+    - name: Get RHTPA bearer token (client_credentials)
+      ansible.builtin.uri:
+        url: "https://{{ keycloak_host }}/realms/{{ realm }}/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          grant_type: client_credentials
+          client_id: "{{ client_id }}"
+          client_secret: "{{ rhtpa_client_secret }}"
+        validate_certs: "{{ validate_certs }}"
+      register: rhtpa_tok
+      no_log: "{{ hide_secrets }}"
+
+    - name: Set auth header
+      ansible.builtin.set_fact:
+        rhtpa_headers:
+          Authorization: "Bearer {{ rhtpa_tok.json.access_token }}"
+      no_log: "{{ hide_secrets }}"
+
+    # ---------- 2. Resolve target package + vulnerable versions ----------
+    - name: Get vulnerability record from RHTPA
+      ansible.builtin.uri:
+        url: "https://{{ rhtpa_host }}/api/v3/vulnerability/{{ target_cve }}"
+        headers: "{{ rhtpa_headers }}"
+        validate_certs: "{{ validate_certs }}"
+        return_content: true
+      register: vuln
+      failed_when: false
+
+    - name: Query OSV (only when cve_record lacks the package or its ranges)
+      ansible.builtin.uri:
+        url: "https://api.osv.dev/v1/vulns/{{ target_cve }}"
+        validate_certs: "{{ validate_certs }}"
+        return_content: true
+        timeout: 20
+      register: osv
+      failed_when: false
+      when: >-
+        record_pkg | length == 0 or
+        (rec_data.remediation.vulnerable_ranges | default([]) | length == 0
+         and rec_data.remediation.fixed_versions | default([]) | length != 1)
+
+    - name: Resolve package name
+      vars:
+        osv_ok: "{{ osv is not skipped and (osv.status | default(0)) == 200 and osv.json is defined }}"
+        osv_aff: "{{ osv.json.affected | default([]) if osv_ok else [] }}"
+        osv_name: "{{ (osv_aff | first).package.name | default('') if osv_aff | length > 0 else '' }}"
+        vuln_ok: "{{ (vuln.status | default(0)) == 200 and vuln.json is defined }}"
+        vuln_title: "{{ vuln.json.title | default('') if vuln_ok else '' }}"
+        title_name: "{{ vuln_title | regex_search(' in (\\S+)$', '\\1') | default([''], true) | first }}"
+        reg_name: "{{ fallback_registry[target_cve] | default('') }}"
+      ansible.builtin.set_fact:
+        pkg_name: >-
+          {{ (cve_package | default(record_pkg, true) | default(osv_name, true)
+              | default(title_name, true) | default(reg_name, true))
+             | lower | regex_replace('[-_.]+', '-') }}
+        pkg_source: >-
+          {{ 'cve_package override' if cve_package | length > 0
+             else (record_pkg_source if record_pkg | length > 0
+             else ('OSV' if osv_name | length > 0
+             else ('RHTPA title' if title_name | length > 0
+             else ('fallback registry' if reg_name | length > 0 else 'none')))) }}
+        affected_versions: >-
+          {{ osv_aff
+             | selectattr('package', 'defined')
+             | selectattr('package.name', 'defined')
+             | list
+             | map(attribute='versions', default=[])
+             | flatten | map('string') | unique | list }}
+        vuln_in_rhtpa: "{{ vuln_ok }}"
+        vuln_title_out: "{{ rec_data.title | default(vuln_title, true) | default('N/A', true) }}"
+        vuln_desc_out: "{{ rec_data.description | default(vuln.json.description | default('N/A') if vuln_ok else 'N/A', true) }}"
+
+    - name: Fail if package could not be resolved
+      ansible.builtin.assert:
+        that: pkg_name | length > 0
+        fail_msg: >-
+          Could not determine the affected package for {{ target_cve }} from cve_record, OSV,
+          RHTPA or the fallback registry. Pass -e cve_package=<pypi-name> to set it explicitly.
+
+    - name: Build vulnerable version ranges for the package
+      vars:
+        pkg_re: "{{ '^' ~ (pkg_name | regex_replace('-', '[-_.]')) }}"
+        range_strings: "{{ rec_data.remediation.vulnerable_ranges | default([]) }}"
+        fixed_list: >-
+          {{ rec_data.remediation.fixed_versions | default([])
+             | select('search', pkg_re ~ '@', ignorecase=true)
+             | map('regex_replace', '^.*@', '') | list }}
+      ansible.builtin.set_fact:
+        fixed_versions_pkg: "{{ fixed_list }}"
+        vuln_ranges_raw: >-
+          {%- set out = [] -%}
+          {%- for r in range_strings -%}
+            {%- set nm = r | regex_search('^[A-Za-z0-9._-]+') | default('', true) -%}
+            {%- set starts_with_op = (r | trim)[:1] in ['<', '>', '=', '!', '~'] -%}
+            {%- if starts_with_op or (nm | lower | regex_replace('[-_.]+', '-')) == pkg_name -%}
+              {%- set body = r | trim if starts_with_op else (r | regex_replace('^[A-Za-z0-9._-]+\s*', '')) -%}
+              {%- set cons = [] -%}
+              {%- for part in body.split(',') -%}
+                {%- set p = part | trim -%}
+                {%- set op = p | regex_search('^(<=|>=|==|!=|<|>|=)') | default('', true) -%}
+                {%- set v = (p[op | length:]) | trim -%}
+                {%- if op and v -%}
+                  {%- set _ = cons.append({'op': '==' if op == '=' else op, 'ver': v}) -%}
+                {%- endif -%}
+              {%- endfor -%}
+              {%- if cons -%}{%- set _ = out.append(cons) -%}{%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- if out | length == 0 and fixed_list | length == 1 -%}
+            {%- set _ = out.append([{'op': '<', 'ver': fixed_list[0]}]) -%}
+          {%- endif -%}
+          {{ out | to_json }}
+
+    - name: Normalise ranges and choose matching basis
+      ansible.builtin.set_fact:
+        vuln_ranges: "{{ vuln_ranges_raw | from_json if vuln_ranges_raw is string else vuln_ranges_raw }}"
+
+    - name: Set matching basis
+      ansible.builtin.set_fact:
+        match_basis: >-
+          {{ 'version ranges' if vuln_ranges | length > 0
+             else ('OSV affected list (' ~ (affected_versions | length) ~ ' versions)' if affected_versions | length > 0
+             else 'unknown - any version will be flagged') }}
+
+    - name: Show target
+      ansible.builtin.debug:
+        msg:
+          - "Vulnerability    : {{ target_cve }} ({{ 'present' if vuln_in_rhtpa else 'NOT found' }} in RHTPA)"
+          - "Title            : {{ vuln_title_out }}"
+          - "Description      : {{ vuln_desc_out | truncate(200) }}"
+          - "Target package   : {{ pkg_name }} (source: {{ pkg_source }})"
+          - "Other packages   : {{ (record_pkg_all | reject('equalto', pkg_name) | join(', ')) | default('none', true) }}"
+          - "Vulnerable if    : {% for rng in vuln_ranges %}{{ ' OR ' if not loop.first }}({% for c in rng %}{{ ', ' if not loop.first }}{{ c.op }} {{ c.ver }}{% endfor %}){% else %}n/a{% endfor %}"
+          - "Fixed version(s) : {{ fixed_versions_pkg | join(', ') | default('unknown', true) }}"
+          - "Matching basis   : {{ match_basis }}"
+
+    # ---------- 3. Audit stored SBOMs ----------
+    # RHTPA list endpoints return "total": null, so paging cannot be planned from a count.
+    # tasks/tpa_paged_get.yml keeps reading until a page is shorter than page_size.
+    - name: List stored SBOMs (all pages)
+      ansible.builtin.include_tasks: tasks/tpa_paged_get.yml
+      vars:
+        _pg_url: "https://{{ rhtpa_host }}/api/v3/sbom"
+        _pg_key: __sbom_list__
+        _pg_label: SBOM list
+
+    - name: Extract SBOM list
+      ansible.builtin.set_fact:
+        sboms: "{{ tpa_paged['__sbom_list__'] }}"
+        sbom_list_meta: "{{ tpa_paged_meta['__sbom_list__'] }}"
+
+    - name: Fail if the SBOM list could not be read completely
+      ansible.builtin.fail:
+        msg: >-
+          SBOM list: HTTP {{ sbom_list_meta.status }}, {{ sbom_list_meta.items }} SBOMs in
+          {{ sbom_list_meta.pages }} page(s){{ ' - stopped at pager_max_items=' ~ pager_max_items
+          if sbom_list_meta.status == 200 else '' }}. Affected SBOMs could be missed.
+      when: not sbom_list_meta.complete | bool
+
+    - name: Get packages for each SBOM (all pages)
+      ansible.builtin.include_tasks: tasks/tpa_paged_get.yml
+      loop: "{{ sboms }}"
+      loop_control:
+        loop_var: sbom
+        label: "{{ sbom.name | default(sbom.id) }}"
+      vars:
+        _pg_url: "https://{{ rhtpa_host }}/api/v3/sbom/{{ sbom.id | string | urlencode }}/packages"
+        _pg_key: "{{ sbom.id | string }}"
+        _pg_label: "packages of {{ sbom.name | default(sbom.id) }}"
+
+    - name: Build per-SBOM package results
+      ansible.builtin.set_fact:
+        pkg_results_raw: >-
+          {%- set res = [] -%}
+          {%- for sb in sboms -%}
+            {%- set key = sb.id | string -%}
+            {%- set _ = res.append({'item': sb,
+                  'status': tpa_paged_meta[key].status | default(-1),
+                  'json': {'items': tpa_paged[key] | default([])}}) -%}
+          {%- endfor -%}
+          {{ {'results': res} | to_json }}
+        pkg_fetch_report: >-
+          {{ sboms | map(attribute='id') | map('string')
+             | map('extract', tpa_paged_meta) | list }}
+      no_log: true
+
+    - name: Normalise package results
+      ansible.builtin.set_fact:
+        pkg_results: "{{ pkg_results_raw | from_json if pkg_results_raw is string else pkg_results_raw }}"
+      no_log: true
+
+    - name: Packages fetched per SBOM
+      ansible.builtin.debug:
+        msg: >-
+          {%- set lines = [] -%}
+          {%- for sb in sboms -%}
+            {%- set m = pkg_fetch_report[loop.index0] -%}
+            {%- set _ = lines.append((sb.name | default(sb.id) | string) ~ ': ' ~ m['items'] ~ ' packages in '
+                  ~ m.pages ~ ' page(s)'
+                  ~ ('' if m.complete else '   <== INCOMPLETE')
+                  ~ ('' if m.status == 200 else '   <== HTTP ' ~ m.status)) -%}
+          {%- endfor -%}
+          {{ lines }}
+
+    - name: Fail if any SBOM package list could not be read completely
+      ansible.builtin.fail:
+        msg: >-
+          Package lists were incomplete for:
+          {{ sboms | zip(pkg_fetch_report) | rejectattr('1.complete') | map(attribute='0.name', default='?') | join(', ') }}.
+          Check RHTPA (HTTP status above) or raise pager_max_items - otherwise affected SBOMs can be missed.
+      when: pkg_fetch_report | rejectattr('complete') | list | length > 0
+
+    - name: Match target package in each SBOM
+      ansible.builtin.set_fact:
+        audit_raw: >-
+          {%- set out = [] -%}
+          {%- set pkg_re_name = pkg_name | regex_replace('-', '[-_.]') -%}
+          {%- for r in pkg_results.results | default([]) -%}
+            {%- set body = r.json | default({}) -%}
+            {%- if body is mapping and 'items' in body -%}{%- set pkgs = body['items'] -%}
+            {%- elif body is sequence and body is not string -%}{%- set pkgs = body -%}
+            {%- else -%}{%- set pkgs = [] -%}{%- endif -%}
+            {%- set hits = [] -%}
+            {%- for p in pkgs -%}
+              {%- set blob = p | to_json | lower -%}
+              {%- set pname = (p.name | default('')) | string | lower | regex_replace('[-_.]+', '-') -%}
+              {%- set in_purl = blob is search('/' ~ pkg_re_name ~ '@') -%}
+              {%- if pname == pkg_name or in_purl -%}
+                {%- set ver = (p.version | default('')) | string -%}
+                {%- if ver == '' -%}
+                  {%- set ver = blob | regex_search('/' ~ pkg_re_name ~ '@([^"?#&]+)', '\\1') | default([''], true) | first -%}
+                {%- endif -%}
+                {%- set ns = namespace(vuln=false) -%}
+                {%- if ver == '' -%}
+                  {%- set ns.vuln = true -%}
+                {%- elif vuln_ranges | length > 0 -%}
+                  {%- for rng in vuln_ranges -%}
+                    {%- set inner = namespace(ok=true) -%}
+                    {%- for c in rng -%}
+                      {%- if not (ver is version(c.ver, c.op, version_type=version_compare_type)) -%}
+                        {%- set inner.ok = false -%}
+                      {%- endif -%}
+                    {%- endfor -%}
+                    {%- if inner.ok -%}{%- set ns.vuln = true -%}{%- endif -%}
+                  {%- endfor -%}
+                {%- elif affected_versions | length > 0 -%}
+                  {%- set ns.vuln = ver in affected_versions -%}
+                {%- else -%}
+                  {%- set ns.vuln = true -%}
+                {%- endif -%}
+                {%- set _ = hits.append({'version': ver, 'vulnerable': ns.vuln}) -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {%- if hits | length > 0 -%}
+              {%- set _ = out.append({'id': r.item.id, 'name': r.item.name | default('N/A'), 'hits': hits}) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ out | to_json }}
+
+    - name: Normalise audit result
+      ansible.builtin.set_fact:
+        sboms_with_pkg: "{{ audit_raw | from_json if audit_raw is string else audit_raw }}"
+        vulnerable_sboms: []
+
+    - name: Keep SBOMs that contain an affected version
+      ansible.builtin.set_fact:
+        vulnerable_sboms: "{{ vulnerable_sboms + [item] }}"
+      loop: "{{ sboms_with_pkg }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: item.hits | selectattr('vulnerable') | list | length > 0
+
+    - name: Report vulnerable SBOMs
+      ansible.builtin.debug:
+        msg: "ALERT {{ item.name }} ({{ item.id }}) - {{ pkg_name }} version(s): {{ item.hits | selectattr('vulnerable') | map(attribute='version') | unique | join(', ') }}"
+      loop: "{{ vulnerable_sboms }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Report SBOMs that contain the package at a fixed version
+      ansible.builtin.debug:
+        msg: "OK    {{ item.name }} ({{ item.id }}) - {{ pkg_name }} version(s): {{ item.hits | map(attribute='version') | unique | join(', ') }}"
+      loop: "{{ sboms_with_pkg | rejectattr('id', 'in', vulnerable_sboms | map(attribute='id') | list) | list }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "SBOMs audited           : {{ sboms | length }}"
+          - "Contain {{ pkg_name }}   : {{ sboms_with_pkg | length }}"
+          - "At a vulnerable version : {{ vulnerable_sboms | length }}"
+          - "RESULT: {{ 'ACTION REQUIRED' if vulnerable_sboms | length > 0 else 'PASSED' }}"
+
+    # ---------- 4. Download vulnerable SBOMs ----------
+    - name: Download vulnerable SBOMs
+      when:
+        - download_sboms | bool
+        - vulnerable_sboms | length > 0
+      block:
+        #- name: Create download directory
+        #  ansible.builtin.file:
+        #    path: "{{ sbom_download_dir }}/{{ target_cve }}"
+        #    state: directory
+        #    mode: "0750"
+
+        #- name: Download SBOM documents
+        #  ansible.builtin.uri:
+        #    url: "https://{{ rhtpa_host }}{{ sbom_download_path | replace('{id}', item.id | string | urlencode) }}"
+        #    headers: "{{ rhtpa_headers }}"
+        #    validate_certs: "{{ validate_certs }}"
+        #    dest: "{{ sbom_download_dir }}/{{ target_cve }}/{{ item.name | regex_replace('[^A-Za-z0-9._-]', '_') }}_{{ item.id | string | regex_replace('[^A-Za-z0-9._-]', '_') }}.json"
+        #    mode: "0640"
+        #    status_code: [200]
+        #  loop: "{{ vulnerable_sboms }}"
+        #  loop_control:
+        #    label: "{{ item.name }}"
+        #  register: sbom_downloads
+
+        #- name: Show downloaded files
+        #  ansible.builtin.debug:
+        #    msg: "{{ sbom_downloads.results | map(attribute='path') | list }}"
+
+        - name: Show Affected SBOM UUID
+          ansible.builtin.debug:
+            var: vulnerable_sboms
+
+        - name: Publish record to downstream workflow nodes (AAP)
+          ansible.builtin.set_stats:
+            data:
+              vulnerable_sboms: "{{ vulnerable_sboms }}"
+
+    - name: Publish results for workflow
+      ansible.builtin.set_stats:
+        data:
+          cve_impact_cve: "{{ target_cve }}"
+          cve_impact_package: "{{ pkg_name }}"
+          cve_impact_fixed_versions: "{{ fixed_versions_pkg }}"
+          cve_impact_vulnerable_ranges: "{{ vuln_ranges }}"
+          cve_impact_sbom_count: "{{ sboms | length }}"
+          cve_impact_vulnerable: "{{ vulnerable_sboms }}"
+          cve_impact_sbom_files: "{{ sbom_downloads.results | default([]) | map(attribute='path') | list }}"
+
+
+
+    - name: Post to Slack
+      ansible.builtin.include_tasks: tasks/slack_notify.yml
+      vars:
+        slack_status: completed
+        slack_title: "SBOM Affected BY {{ target_cve }}"
+        slack_text: "SBOMs audited           : {{ sboms | length }}\nLibary: {{ pkg_name }}\nContain {{ pkg_name }}   : {{ sboms_with_pkg | length }}\nAt a vulnerable version : {{ vulnerable_sboms | length }}\nRESULT: {{ 'ACTION REQUIRED' if vulnerable_sboms | length > 0 else 'PASSED' }}\n\nCheck the AAP job output for details.\nLink: https://myaap-ansible-automation-platform.apps.hub.lab.com/execution/jobs/playbook/{{ awx_job_id }}/output"
+        slack_new_thread: false
+        slack_broadcast: false
+
+
+    #- name: Fail job when vulnerable SBOMs found
+    #  ansible.builtin.fail:
+    #    msg: "{{ vulnerable_sboms | length }} SBOM(s) contain a vulnerable {{ pkg_name }} for {{ target_cve }}"
+    #  when:
+    #    - fail_on_affected | bool
+    #    - vulnerable_sboms | length > 0

@@ -11,7 +11,8 @@
 #   published  most recent published date (CVEs without a date go last)
 #
 # The script read one page (limit=100), so it could miss the latest CVE once TPA holds more.
-# This playbook reads every page (up to max_items) before sorting.
+# This playbook reads every page (up to max_items) before sorting. TPA returns "total": null,
+# so paging uses tasks/tpa_paged_get.yml, which reads until a page comes back short.
 #
 # Outputs (set_stats, for the next workflow node):
 #   tpa_latest_cve   {id, title, published}
@@ -120,41 +121,24 @@
       no_log: "{{ hide_secrets }}"
 
     # ---------- 2. Fetch every page ----------
-    - name: Fetch first page of vulnerabilities
-      ansible.builtin.uri:
-        url: "https://{{ rhtpa_host }}/api/v3/vulnerability?offset=0&limit={{ page_size }}"
-        headers: "{{ rhtpa_headers }}"
-        validate_certs: "{{ validate_certs }}"
-        return_content: true
-      register: tpa_page1
-      failed_when: tpa_page1.status != 200 or tpa_page1.json is not defined or tpa_page1.json is not mapping
-
-    - name: Work out how many more pages to read
-      ansible.builtin.set_fact:
-        tpa_total: "{{ tpa_total_n }}"
-        tpa_total_known: "{{ tpa_page1.json.total is defined }}"
-        tpa_offsets: "{{ range(page_size | int, [tpa_total_n | int, max_items | int] | min, page_size | int) | list }}"
+    # RHTPA returns "total": null, so keep reading until a page is shorter than page_size.
+    - name: Fetch all vulnerabilities (all pages)
+      ansible.builtin.include_tasks: tasks/tpa_paged_get.yml
       vars:
-        # use the API's total when present; otherwise assume one page
-        tpa_total_n: "{{ tpa_page1.json.total | default(tpa_page1.json['items'] | default([]) | length) | int }}"
-
-    - name: Fetch remaining pages
-      ansible.builtin.uri:
-        url: "https://{{ rhtpa_host }}/api/v3/vulnerability?offset={{ item }}&limit={{ page_size }}"
-        headers: "{{ rhtpa_headers }}"
-        validate_certs: "{{ validate_certs }}"
-        return_content: true
-      loop: "{{ tpa_offsets }}"
-      loop_control:
-        label: "offset {{ item }}"
-      register: tpa_pages
+        _pg_url: "https://{{ rhtpa_host }}/api/v3/vulnerability"
+        _pg_key: __vulnerabilities__
+        _pg_label: vulnerability list
+        pager_max_items: "{{ max_items }}"
 
     - name: Combine all pages
       ansible.builtin.set_fact:
-        tpa_items: >-
-          {{ (tpa_page1.json['items'] | default([]))
-             + (tpa_pages.results | default([]) | selectattr('json', 'defined')
-                | map(attribute='json') | map(attribute='items', default=[]) | flatten(levels=1) | list) }}
+        tpa_items: "{{ tpa_paged['__vulnerabilities__'] }}"
+        tpa_list_meta: "{{ tpa_paged_meta['__vulnerabilities__'] }}"
+
+    - name: Fail if the vulnerability list could not be read
+      ansible.builtin.fail:
+        msg: "RHTPA vulnerability list returned HTTP {{ tpa_list_meta.status }}."
+      when: tpa_list_meta.status != 200
 
     # ---------- 3. Sort ----------
     # Keys are built as strings so they sort correctly:
@@ -208,7 +192,7 @@
           - "Latest CVE  : {{ tpa_latest_cve.id }}   (sorted by {{ 'CVE number' if sort_by == 'id' else 'published date' }})"
           - "Title       : {{ tpa_latest_cve.title | default('n/a', true) }}"
           - "Published   : {{ tpa_latest_cve.published | default('n/a', true) }}"
-          - "Read        : {{ tpa_items | length }} of {{ tpa_total }} vulnerabilities in TPA ({{ tpa_sorted | length }} {{ 'CVEs' if cve_only | bool else 'entries' }})"
+          - "Read        : {{ tpa_items | length }} vulnerabilities from TPA in {{ tpa_list_meta.pages }} page(s) ({{ tpa_sorted | length }} {{ 'CVEs' if cve_only | bool else 'entries' }})"
 
     - name: Show top {{ top_n }} CVEs
       ansible.builtin.debug:
@@ -221,18 +205,9 @@
     - name: Warn if the safety cap stopped reading early
       ansible.builtin.debug:
         msg: >-
-          WARNING: TPA reports {{ tpa_total }} vulnerabilities but only {{ tpa_items | length }} were read
-          (max_items={{ max_items }}). Raise max_items, or the latest CVE may be missed.
-      when: tpa_items | length < tpa_total | int
-
-    - name: Warn if TPA did not report a total
-      ansible.builtin.debug:
-        msg: >-
-          WARNING: TPA did not return 'total', so only the first page ({{ page_size }}) was read.
-          Raise page_size (e.g. -e page_size=10000) to be sure the latest CVE is included.
-      when:
-        - not tpa_total_known | bool
-        - tpa_items | length >= page_size | int
+          WARNING: stopped after {{ tpa_items | length }} vulnerabilities (max_items={{ max_items }}) and TPA
+          had more. Raise max_items, or the latest CVE may be missed.
+      when: not tpa_list_meta.complete | bool
 
     - name: Publish result to downstream workflow nodes
       ansible.builtin.set_stats:
