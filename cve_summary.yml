@@ -1,0 +1,102 @@
+---
+# cve_lookup.yml - look up any CVE across public sources and emit one normalised JSON record.
+#
+# Usage:
+#   ansible-playbook cve_lookup.yml -e cve_id=CVE-2024-23334
+#   ansible-playbook cve_lookup.yml -e cve_id=CVE-2024-6387 -e "rh_products='Red Hat Enterprise Linux 9'"
+#   ansible-playbook cve_lookup.yml -e cve_id=CVE-2024-6387 -e write_report=false
+#
+# Optional environment variables:
+#   GITHUB_TOKEN  raises the GitHub Advisory API limit from 60 to 5,000 requests/hour
+#   NVD_API_KEY   raises the NVD API limit from 5 to 50 requests per 30 seconds
+#
+# Sources (all optional - the record is built from whichever ones answer):
+#   CVE.org        title, description, CNA/ADP CVSS, CPEs, solutions, workarounds, CISA KEV + SSVC
+#   NVD            description fallback, vulnerable CPE matches, NVD CVSS, CWE, CISA KEV fields
+#   GitHub (GHSA)  ecosystem, repository URL, vulnerable ranges, first patched version
+#   OSV.dev        package URLs, affected and fixed versions
+#   Red Hat        RPM purls, product CPEs, severity, statement, mitigation, RHSA, fix state
+#   FIRST EPSS     probability of exploitation in the next 30 days
+#
+# Controller requirements: ansible-core only (no jmespath / extra collections).
+
+- name: CVE detail lookup
+  hosts: all
+  gather_facts: false
+
+  vars:
+    cve_id: ""
+    # Limit Red Hat advisories / product status to these products (substring match).
+    # List, or comma-separated string from the CLI. Empty = all products.
+    rh_products: []
+    query_epss: true
+    output_dir: "{{ playbook_dir }}/cve_reports"
+    write_report: true
+    http_timeout: 30
+    github_token: "{{ lookup('ansible.builtin.env', 'GITHUB_TOKEN') | default('', true) }}"
+    nvd_api_key: "{{ lookup('ansible.builtin.env', 'NVD_API_KEY') | default('', true) }}"
+
+    gh_headers: >-
+      {{ {'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'}
+         | combine({'Authorization': 'Bearer ' ~ github_token} if github_token | length > 0 else {}) }}
+
+    # GitHub advisory ecosystem names -> OSV / purl-style names
+    ghsa_ecosystem_map:
+      pip: PyPI
+      npm: npm
+      maven: Maven
+      go: Go
+      nuget: NuGet
+      rubygems: RubyGems
+      composer: Packagist
+      rust: crates.io
+      erlang: Hex
+      pub: Pub
+      swift: SwiftURL
+      actions: GitHub Actions
+
+    # Files to scan in a repository to see whether it depends on the affected package
+    manifest_files_by_ecosystem:
+      PyPI: [requirements.txt, pyproject.toml, setup.py, setup.cfg, Pipfile, Pipfile.lock, poetry.lock, uv.lock]
+      npm: [package.json, package-lock.json, yarn.lock, pnpm-lock.yaml]
+      Maven: [pom.xml, build.gradle, build.gradle.kts, gradle.lockfile]
+      Go: [go.mod, go.sum]
+      NuGet: ["*.csproj", packages.config, packages.lock.json, Directory.Packages.props]
+      RubyGems: [Gemfile, Gemfile.lock, "*.gemspec"]
+      Packagist: [composer.json, composer.lock]
+      crates.io: [Cargo.toml, Cargo.lock]
+      Hex: [mix.exs, mix.lock]
+      Pub: [pubspec.yaml, pubspec.lock]
+      SwiftURL: [Package.swift, Package.resolved]
+      GitHub Actions: [".github/workflows/*.yml", ".github/workflows/*.yaml"]
+      Red Hat: [Containerfile, Dockerfile, "*.spec", "*.ks"]
+
+    cpe_part_names:
+      a: application
+      o: operating system
+      h: hardware
+
+  tasks:
+    # ------------------------------------------------------------------ input
+    - name: Normalise inputs
+      ansible.builtin.set_fact:
+        cve: "{{ cve_id | string | trim | upper }}"
+        rh_product_filter: >-
+          {{ (rh_products.split(',') if rh_products is string else rh_products)
+             | map('trim') | select | list }}
+
+    - name: Validate CVE ID format
+      ansible.builtin.assert:
+        that:
+          - cve is match('^CVE-[0-9]{4}-[0-9]{4,}$')
+        fail_msg: "Invalid or missing cve_id '{{ cve_id }}'. Example: -e cve_id=CVE-2024-23334"
+        quiet: true
+
+    - name: Post to Slack
+      ansible.builtin.include_tasks: tasks/slack_notify.yml
+      vars:
+        slack_status: completed
+        slack_title: "{{ cve_record.cve_id }} - {{ cve_record.title }}"
+        slack_text: "{{ description }}\n\nCheck the AAP job output for details.\nLink: https://myaap-ansible-automation-platform.apps.hub.lab.com/execution/jobs/playbook/{{ awx_job_id }}/output"
+        slack_new_thread: false
+        slack_broadcast: false
