@@ -237,8 +237,9 @@
     - name: Publish result to downstream workflow nodes
       ansible.builtin.set_stats:
         data: >-
-          {{ {'tpa_latest_cve': tpa_latest_cve, 'tpa_cve_list': tpa_cve_list}
-             | combine({'cve_id': tpa_latest_cve.id} if publish_cve_id | bool else {}) }}
+          'tpa_latest_cve': "{{ tpa_latest_cve }}"
+          #{{ {'tpa_latest_cve': tpa_latest_cve, 'tpa_cve_list': tpa_cve_list}
+          #   | combine({'cve_id': tpa_latest_cve.id} if publish_cve_id | bool else {}) }}
 
     - debug:
         var: tpa_latest_cve
