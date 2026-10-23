@@ -221,7 +221,7 @@
       ansible.builtin.include_tasks: tasks/slack_notify.yml
       vars:
         slack_status: completed
-        slack_title: "Requirements push to Git"
+        slack_title: "Push requirements.txt to Git"
         slack_text: "{{ slack_bundle_text }}\n\nCheck the AAP job output for details.\nLink: https://myaap-ansible-automation-platform.apps.hub.lab.com/execution/jobs/playbook/{{ awx_job_id }}/output"
         slack_new_thread: false
         slack_broadcast: false
