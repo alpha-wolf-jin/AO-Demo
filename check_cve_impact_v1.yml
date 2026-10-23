@@ -116,6 +116,8 @@
       when: rhtpa_client_secret | default('') | length == 0
       no_log: "{{ hide_secrets }}"
       block:
+        # Each call is allowed to "fail" so the next task can report the HTTP status and
+        # Keycloak's error text. Those reports never print tokens or secrets.
         - name: Admin token (master realm)
           ansible.builtin.uri:
             url: "https://{{ keycloak_host }}/realms/master/protocol/openid-connect/token"
@@ -128,6 +130,20 @@
               password: "{{ keycloak_admin_password }}"
             validate_certs: "{{ validate_certs }}"
           register: admin_tok
+          failed_when: false
+
+        - name: Check admin token
+          ansible.builtin.assert:
+            that:
+              - admin_tok.status | default(-1) == 200
+              - admin_tok.json.access_token | default('') | length > 0
+            fail_msg: >-
+              Keycloak admin login failed for user '{{ keycloak_admin_user }}' on {{ keycloak_host }}:
+              HTTP {{ admin_tok.status | default('n/a') }}
+              {{ admin_tok.json.error | default('') }} {{ admin_tok.json.error_description | default('') }}
+              {{ '' if admin_tok.json is defined else (admin_tok.msg | default('') | regex_replace('Bearer [^ ]+', 'Bearer ***')) }}
+            quiet: true
+          no_log: false
 
         - name: Find client UUID
           ansible.builtin.uri:
@@ -135,6 +151,28 @@
             headers: { Authorization: "Bearer {{ admin_tok.json.access_token }}" }
             validate_certs: "{{ validate_certs }}"
           register: client_lookup
+          failed_when: false
+
+        - name: Check client lookup
+          ansible.builtin.assert:
+            that:
+              - client_lookup.status | default(-1) == 200
+              - client_lookup.json is defined
+              - client_lookup.json is sequence and client_lookup.json is not string
+              - client_lookup.json | length > 0
+            fail_msg: >-
+              Keycloak client lookup for '{{ client_id }}' in realm '{{ realm }}' failed:
+              HTTP {{ client_lookup.status | default('n/a') }}
+              {{ (client_lookup.json.error | default('') ~ ' ' ~ client_lookup.json.error_description | default(''))
+                 if client_lookup.json is mapping else '' }}
+              {{ ('(client ' ~ client_id ~ ' not found in realm ' ~ realm ~ ')')
+                 if (client_lookup.status | default(-1) == 200 and (client_lookup.json | default([]) | length) == 0) else '' }}
+              {{ '' if client_lookup.json is defined else (client_lookup.msg | default('') | regex_replace('Bearer [^ ]+', 'Bearer ***')) }}
+              - 401: admin token rejected (Keycloak restarted / token expired - rerun);
+              403: user '{{ keycloak_admin_user }}' lacks view-clients on realm '{{ realm }}';
+              -1: network, proxy or TLS problem from {{ inventory_hostname }}.
+            quiet: true
+          no_log: false
 
         - name: Read client secret
           ansible.builtin.uri:
@@ -142,6 +180,19 @@
             headers: { Authorization: "Bearer {{ admin_tok.json.access_token }}" }
             validate_certs: "{{ validate_certs }}"
           register: secret_lookup
+          failed_when: false
+
+        - name: Check client secret
+          ansible.builtin.assert:
+            that:
+              - secret_lookup.status | default(-1) == 200
+              - secret_lookup.json.value | default('') | length > 0
+            fail_msg: >-
+              Reading the '{{ client_id }}' client secret failed: HTTP {{ secret_lookup.status | default('n/a') }}
+              {{ (secret_lookup.json.error | default('')) if secret_lookup.json is mapping else '' }}
+              (403 = user '{{ keycloak_admin_user }}' lacks manage-clients on realm '{{ realm }}').
+            quiet: true
+          no_log: false
 
         - name: Store client secret
           ansible.builtin.set_fact:
