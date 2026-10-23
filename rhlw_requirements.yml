@@ -61,8 +61,9 @@
     # ---- rhlw approval / Slack message wording ----
     rhlw_vendor_name: "Lightwell backport Fix"            # header: "APPROVAL For <vendor>: <CVE> Backporting Fix"
     rhlw_advisory_label: "CVE Advisor if"             # label before the vulnerable range
-    # Slack has no text colour. How the "Backporting Fix" line is highlighted in Slack:
-    #   emoji = marker emoji + whole line bold   e.g. 🔴 *Backporting Fix: flask 2.2.2 -> ==2.2.2-rhlw-00001*
+    rhlw_fix_label: "Backport Fix"                    # label of the per-SBOM fix line; the Slack highlight matches this
+    # Slack has no text colour. How the "<rhlw_fix_label>" line is highlighted in Slack:
+    #   emoji = marker emoji + whole line bold   e.g. 🔴 *Backport Fix: flask 2.2.2 -> ==2.2.2-rhlw-00001*
     #   code  = bold label + version in inline code (colour depends on the viewer's Slack theme)
     #   bold  = whole line bold
     #   plain = no formatting
@@ -615,7 +616,7 @@
             {%- set _ = L.append('') -%}
             {%- set _ = L.append('[' ~ loop.index ~ '] ' ~ i.sbom_name ~ ' (' ~ i.sbom_id ~ ')') -%}
             {%- set _ = L.append('    File      : ' ~ i.requirements_file) -%}
-            {%- set _ = L.append('    Backport Fix: '
+            {%- set _ = L.append('    ' ~ rhlw_fix_label ~ ': '
                   ~ ((target_norm ~ ' ' ~ (i.cve_installed | default('?', true)) ~ ' -> ' ~ cve_op ~ i.cve_proposed)
                      if (i.cve_package_present and i.cve_proposed) else i.cve_fix_check)) -%}
             {%- set _ = L.append('') -%}
@@ -694,24 +695,24 @@
           requirements_approval: "{{ requirements_approval }}"
           requirements_content: "{{ requirements_content }}"
 
-    # Slack copy of the approval message: in rhlw mode the "Backporting Fix" line is highlighted with mrkdwn
+    # Slack copy of the approval message: in rhlw mode the rhlw_fix_label line is highlighted with mrkdwn
     - name: Build Slack approval text
       vars:
         nl: "\n"
       ansible.builtin.set_fact:
         slack_approval_text: >-
-          {%- set key = 'Backporting Fix: ' -%}
+          {%- set key = rhlw_fix_label ~ ': ' -%}
           {%- set out = [] -%}
           {%- for l in requirements_approval.splitlines() -%}
             {%- if rhlw | bool and l.strip().startswith(key) and rhlw_slack_highlight in ['emoji', 'code', 'bold'] -%}
               {%- set indent = l[:(l | length) - (l.lstrip() | length)] -%}
               {%- set value = l.strip()[key | length:] -%}
               {%- if rhlw_slack_highlight == 'emoji' -%}
-                {%- set _ = out.append(indent ~ rhlw_slack_marker ~ ' *Backporting Fix: ' ~ value ~ '*') -%}
+                {%- set _ = out.append(indent ~ rhlw_slack_marker ~ ' *' ~ key ~ value ~ '*') -%}
               {%- elif rhlw_slack_highlight == 'code' -%}
-                {%- set _ = out.append(indent ~ '*Backporting Fix:* `' ~ value ~ '`') -%}
+                {%- set _ = out.append(indent ~ '*' ~ (key | trim) ~ '* `' ~ value ~ '`') -%}
               {%- else -%}
-                {%- set _ = out.append(indent ~ '*Backporting Fix: ' ~ value ~ '*') -%}
+                {%- set _ = out.append(indent ~ '*' ~ key ~ value ~ '*') -%}
               {%- endif -%}
             {%- else -%}
               {%- set _ = out.append(l) -%}
