@@ -1,0 +1,48 @@
+- name: Send Health Summary Notification
+  #hosts: localhost
+  hosts: all
+  gather_facts: false
+
+  vars:
+    exploit_summary: >-
+      CVE-2026-97687 is exploitable in fx-rate-service-legacy-optB:1.0.0-legacy
+      urllib3: HTTPS proxy TLS configuration may be ignored or overridden
+      
+      Severity:  HIGH (CVSS 8.1)   ·   Red Hat: Important
+      Package:  urllib3   ·   Affected: >= 1.26.0
+      Weakness:  CWE-295 – Improper Certificate Validation
+      
+      Why vulnerable The CVE is exploitable in this container. Investigation revealed that the urllib3 library, specifically version 1.26.14, is used in the codebase and is vulnerable to improper certificate validation. In fx-rate-service/legacy/fxrate_legacy.py, the urllib3 connection pool is used with verify=False, which could potentially allow for man-in-the-middle attacks, and no configuration entries were found that disable or secure this behavior. The use of urllib3 with verify=False creates a condition where an attacker could exploit the vulnerability to observe or modify traffic.
+      
+      Code to review
+      •  fx-rate-service/legacy/fxrate_legacy.py
+
+  tasks:
+    - name: Build compact input for the AI risk assessment
+      ansible.builtin.set_fact:
+        ai_input:
+          cve:
+            cve_id: "{{ cve_record.cve_id }}"
+            title: "{{ cve_record.title | default('') }}"
+            description: "{{ cve_record.description | default('') | truncate(1500) }}"
+            cwes: "{{ cve_record.cwes | default([]) }}"
+            cvss: "{{ cve_record.cvss | default([]) }}"
+            exploitation: "{{ cve_record.exploitation | default({}) }}"
+            vulnerable_ranges: "{{ cve_record.remediation.vulnerable_ranges | default([]) }}"
+            fixed_versions: "{{ cve_record.remediation.fixed_versions | default([]) }}"
+            red_hat_statement: "{{ cve_record.vendor_notes.red_hat_statement | default('') | truncate(500) }}"
+            red_hat_mitigation: "{{ cve_record.vendor_notes.red_hat_mitigation | default('') | truncate(500) }}"
+          tpa:
+            package: "{{ cve_impact_package }}"
+            vulnerable_ranges: "{{ cve_impact_vulnerable_ranges }}"
+            fixed_versions: "{{ cve_impact_fixed_versions }}"
+            sboms_audited: "{{ cve_impact_sbom_count }}"
+            vulnerable_sboms: "{{ cve_impact_vulnerable }}"
+          exploit_analysis: "{{ exploit_summary | truncate(3000) }}"
+          proposed_treatment: "{{ proposed_treatment | default('Not stated in input') }}"
+
+
+    - name: Overall Data
+      ansible.builtin.debug: 
+        msg: "{{ ai_input }}"
+
