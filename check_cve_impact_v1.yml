@@ -548,7 +548,7 @@
       ansible.builtin.include_tasks: tasks/slack_notify.yml
       vars:
         slack_status: completed
-        slack_title: "SBOM Affected BY {{ target_cve }}"
+        slack_title: "TPA Analysis\n        SBOM Affected BY {{ target_cve }}"
         slack_text: "SBOMs audited: {{ sboms | length }}\nLibary: {{ pkg_name }}\nContain {{ pkg_name }}: {{ sboms_with_pkg | length }}\nAt a vulnerable version: {{ vulnerable_sboms | length }}\nRESULT: {{ 'ACTION REQUIRED' if vulnerable_sboms | length > 0 else 'PASSED' }}\n\nCheck the AAP job output for details.\nLink: https://myaap-ansible-automation-platform.apps.hub.lab.com/execution/jobs/playbook/{{ awx_job_id }}/output"
         slack_new_thread: false
         slack_broadcast: false
