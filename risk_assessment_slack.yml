@@ -177,9 +177,9 @@
           {%- endif -%}
           {%- set _ = L.append('') -%}
           {%- set _ = L.append('✅ *Approve* = proceed with the fix   ·   ❌ *Deny* = no fix — reply in this thread with the reason') -%}
+          {%- set _ = L.append('') -%}
           {%- set _ = L.append('🚨 *LIGHTWELL EXPERT ASSESSMENT REQUIRED*') -%}
           {%- set _ = L.append('Approve / deny: ' ~ approval_url) -%}
-          {%- set _ = L.append('Details: ' ~ aap_job_url) -%}
           {{ L | join(nl) }}
 
     - name: Show the message (as it will be posted)
