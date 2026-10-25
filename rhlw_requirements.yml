@@ -68,11 +68,13 @@
     #   bold  = whole line bold
     #   plain = no formatting
     rhlw_slack_highlight: emoji
-    rhlw_slack_marker: "🔴"                           # used by 'emoji'; ":red_circle:" also works if slack_text is mrkdwn
+    #rhlw_slack_marker: "🔴"                           # used by 'emoji'; ":red_circle:" also works if slack_text is mrkdwn
+    rhlw_slack_marker: "🚨"                      # e.g. "⚠️", "👉", "📣"
 
     # Slack footer: call to action + link to the approvals page
     approval_action_text: "Approval Action Required"
-    approval_action_marker: "🚨"                      # e.g. "⚠️", "👉", "📣"
+    #approval_action_marker: "🚨"                      # e.g. "⚠️", "👉", "📣"
+    approval_action_marker: ""                      # e.g. "⚠️", "👉", "📣"
     approval_url: "https://automation-orchestrator-automation-orchestrator.apps.hub.lab.com/approvals"
 
     # ---- upstream mode settings (rhlw: false) ----
