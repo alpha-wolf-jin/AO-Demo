@@ -32,7 +32,7 @@
     slack_status: paused               # the workflow now waits for the expert
     detail_max_chars: 220
     show_reasons: false                # true = add the AI's likelihood / impact reasoning lines (longer message)
-    show_disagreements: true           # false = hide the "Findings disagree" section (the AI result itself is unchanged)
+    show_disagreements: false           # false = hide the "Findings disagree" section (the AI result itself is unchanged)
 
     risk_matrix:                       # same matrix as the AI prompt
       high:   { low: Medium, medium: High,   high: Critical }
