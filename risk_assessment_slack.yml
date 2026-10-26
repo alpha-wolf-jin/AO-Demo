@@ -32,6 +32,7 @@
     slack_status: paused               # the workflow now waits for the expert
     detail_max_chars: 220
     show_reasons: false                # true = add the AI's likelihood / impact reasoning lines (longer message)
+    show_disagreements: true           # false = hide the "Findings disagree" section (the AI result itself is unchanged)
 
     risk_matrix:                       # same matrix as the AI prompt
       high:   { low: Medium, medium: High,   high: Critical }
@@ -148,7 +149,7 @@
             {%- set _ = L.append('*Trigger (what must be true to exploit):* ' ~ ra.trigger_condition | truncate(detail_max_chars | int)) -%}
           {%- endif -%}
           {%- set _ = L.append('') -%}
-          {%- if failed | length > 0 -%}
+          {%- if show_disagreements | bool and failed | length > 0 -%}
             {%- set _ = L.append('*⚠️ Findings disagree:*') -%}
             {%- for c in failed -%}
               {%- set _ = L.append('•  *' ~ (check_words[c.check] | default(c.check)) ~ '* (' ~ c.result ~ ') — '
@@ -177,9 +178,9 @@
           {%- endif -%}
           {%- set _ = L.append('') -%}
           {%- set _ = L.append('✅ *Approve* = proceed with the fix   ·   ❌ *Deny* = no fix — reply in this thread with the reason') -%}
-          {%- set _ = L.append('') -%}
           {%- set _ = L.append('🚨 *LIGHTWELL EXPERT ASSESSMENT REQUIRED*') -%}
           {%- set _ = L.append('Approve / deny: ' ~ approval_url) -%}
+          {%- set _ = L.append('Details: ' ~ aap_job_url) -%}
           {{ L | join(nl) }}
 
     - name: Show the message (as it will be posted)

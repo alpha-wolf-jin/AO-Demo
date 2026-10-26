@@ -1,0 +1,223 @@
+---
+# risk_assessment_slack.yml - post the AI Risk Assessment to Slack for the Lightwell expert.
+#
+# Workflow position:
+#   ... -> overall_info -> [AI Risk Assessment] -> risk_assessment_slack -> [Lightwell Expert Assessment]
+#       -> rhlw_requirements -> [Approval: Git] -> push_requirements
+#
+# Inputs (workflow artifacts / extra vars):
+#   ai_risk_result      AI output - the full response ({result: {content: {...}}}), just the content
+#                       dict, or either as a JSON string                                  (required)
+#   ai_input            from overall_info (optional) - CVE title, KEV, proposed treatment
+#   proposed_treatment  from overall_info (optional)
+#   slack_thread_ts     optional - reply in the existing CVE thread (used by tasks/slack_notify.yml)
+#
+# The message is built here from the AI's structured fields, not from its human_message, so the
+# layout is always the same and the rating icon always matches. The AI's answer is also checked:
+#   - risk_rating must match the likelihood x impact matrix (the matrix value is used if not)
+#   - if the trigger condition is not shown and KEV is false, the treatment must be "investigate"
+#
+# Outputs (set_stats): risk_assessment {cve_id, risk_rating, primary_treatment, failed_checks, warnings}
+
+- name: Post AI risk assessment to Slack
+  hosts: all
+  gather_facts: false
+
+  vars:
+    ai_risk_result: {}
+    ai_input: {}
+    approval_url: "https://automation-orchestrator-automation-orchestrator.apps.hub.lab.com/approvals"
+    aap_job_url: "https://myaap-ansible-automation-platform.apps.hub.lab.com/execution/jobs/playbook/{{ awx_job_id | default('n/a') }}/output"
+    slack_enabled: true
+    slack_status: paused               # the workflow now waits for the expert
+    detail_max_chars: 220
+    show_reasons: false                # true = add the AI's likelihood / impact reasoning lines (longer message)
+
+    risk_matrix:                       # same matrix as the AI prompt
+      high:   { low: Medium, medium: High,   high: Critical }
+      medium: { low: Low,    medium: Medium, high: High }
+      low:    { low: Low,    medium: Low,    high: Medium }
+    rating_icons: { Critical: "🔴", High: "🟠", Medium: "🟡", Low: "🟢" }
+    treatment_words:
+      backport_fix: "Backport fix"
+      upgrade_upstream: "Upgrade to the fixed upstream version"
+      code_or_config_fix: "Code / config fix"
+      accept_risk: "Accept the risk"
+      investigate: "Investigate first"
+    check_words:
+      trigger_condition: "Trigger condition"
+      version_in_range: "Version in range"
+      sbom_scope: "SBOM scope"
+      fix_coverage: "Fix coverage"
+      severity_agreement: "Severity agreement"
+
+  tasks:
+    # ---------- 1. Read the AI output ----------
+    - name: Unwrap the AI output
+      vars:
+        raw: >-
+          {{ (ai_risk_result | from_json) if (ai_risk_result is string and ai_risk_result | trim | length > 0)
+             else (ai_risk_result if ai_risk_result is mapping else {}) }}
+        inp: >-
+          {{ (ai_input | from_json) if (ai_input is string and ai_input | trim | length > 0)
+             else (ai_input if ai_input is mapping else {}) }}
+      ansible.builtin.set_fact:
+        ra: >-
+          {{ raw.result.content if (raw.result is defined and raw.result.content is defined and raw.result.content is mapping)
+             else (raw.content if (raw.content is defined and raw.content is mapping) else raw) }}
+        ra_status: "{{ raw.status | default('completed') }}"
+        ra_error: "{{ raw.error | default('') }}"
+        ctx: "{{ inp }}"
+
+    - name: Stop if the AI step failed
+      ansible.builtin.fail:
+        msg: "The AI Risk Assessment step returned status '{{ ra_status }}': {{ ra_error | default('no error text', true) }}"
+      when: ra_status != 'completed' or ra_error | length > 0
+
+    - name: Check the AI output has the required fields
+      ansible.builtin.assert:
+        that:
+          - ra.cve_id | default('') is match('^CVE-[0-9]{4}-[0-9]+$')
+          - ra.likelihood | default('') in ['low', 'medium', 'high']
+          - ra.impact | default('') in ['low', 'medium', 'high']
+          - ra.primary_treatment | default('') | length > 0
+        fail_msg: >-
+          AI output is incomplete or not in the expected schema
+          (cve_id='{{ ra.cve_id | default('') }}', likelihood='{{ ra.likelihood | default('') }}',
+          impact='{{ ra.impact | default('') }}', primary_treatment='{{ ra.primary_treatment | default('') }}').
+          Pass the AI response as ai_risk_result.
+        quiet: true
+
+    # ---------- 2. Check the AI's answer ----------
+    - name: Normalise checks (list of objects, or flat check_<name> fields)
+      ansible.builtin.set_fact:
+        ra_checks_raw: >-
+          {%- set out = [] -%}
+          {%- if ra.consistency_checks is defined and ra.consistency_checks | length > 0 -%}
+            {%- for c in ra.consistency_checks -%}
+              {%- set _ = out.append({'check': c.check | default('?'), 'result': (c.result | default('unknown')) | lower,
+                                      'detail': c.detail | default('')}) -%}
+            {%- endfor -%}
+          {%- else -%}
+            {%- for k in check_words -%}
+              {%- if ('check_' ~ k) in ra -%}
+                {%- set _ = out.append({'check': k, 'result': (ra['check_' ~ k] | default('unknown')) | lower,
+                                        'detail': ra['check_' ~ k ~ '_detail'] | default('')}) -%}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endif -%}
+          {{ out | to_json }}
+
+    - name: Validate rating and treatment
+      vars:
+        checks: "{{ ra_checks_raw | from_json if ra_checks_raw is string else ra_checks_raw }}"
+        expected_rating: "{{ risk_matrix[ra.likelihood][ra.impact] }}"
+        trigger_result: "{{ checks | selectattr('check', 'eq', 'trigger_condition') | map(attribute='result') | first | default('unknown') }}"
+        kev: "{{ ctx.cve.exploitation.kev | default('unknown') | string | lower }}"
+      ansible.builtin.set_fact:
+        ra_checks: "{{ checks }}"
+        final_rating: "{{ expected_rating }}"
+        ra_warnings: >-
+          {{ ([('AI rating ' ~ ra.risk_rating ~ ' does not match its own likelihood/impact; using ' ~ expected_rating ~ ' from the matrix')]
+               if (ra.risk_rating | default('') | string) != expected_rating else [])
+             + ([('Trigger condition is ' ~ trigger_result ~ ' and KEV is false, but the AI recommends '
+                  ~ ra.primary_treatment ~ ' - expected investigate')]
+               if (trigger_result in ['fail', 'unknown'] and kev == 'false' and ra.primary_treatment != 'investigate') else [])
+             + ([] if checks | length == 5 else [('AI returned ' ~ (checks | length) ~ ' of 5 consistency checks')]) }}
+
+    # ---------- 3. Build the Slack message ----------
+    - name: Build Slack message
+      vars:
+        nl: "\n"
+        icon: "{{ rating_icons[final_rating] }}"
+        title: "{{ ctx.cve.title | default('') }}"
+        failed: "{{ ra_checks | rejectattr('result', 'eq', 'pass') | list }}"
+        passed: "{{ ra_checks | selectattr('result', 'eq', 'pass') | list }}"
+        treatment_given: "{{ proposed_treatment | default(ctx.proposed_treatment | default(''), true) }}"
+      ansible.builtin.set_fact:
+        slack_title_out: "{{ icon }} Lightwell Expert Assessment needed: {{ ra.cve_id }} ({{ final_rating | upper }} risk)"
+        slack_text_out: >-
+          {%- set L = [] -%}
+          {%- if title -%}{%- set _ = L.append('_' ~ title ~ '_') -%}{%- endif -%}
+          {%- set _ = L.append('*AI risk rating:* ' ~ icon ~ ' *' ~ (final_rating | upper) ~ '*  —  likelihood '
+                ~ ra.likelihood ~ ', impact ' ~ ra.impact) -%}
+          {%- if show_reasons | bool and ra.likelihood_reason | default('') -%}{%- set _ = L.append('      _Likelihood:_ ' ~ ra.likelihood_reason | truncate(detail_max_chars | int)) -%}{%- endif -%}
+          {%- if show_reasons | bool and ra.impact_reason | default('') -%}{%- set _ = L.append('      _Impact:_ ' ~ ra.impact_reason | truncate(detail_max_chars | int)) -%}{%- endif -%}
+          {%- if ra.trigger_condition | default('') -%}
+            {%- set _ = L.append('') -%}
+            {%- set _ = L.append('*Trigger (what must be true to exploit):* ' ~ ra.trigger_condition | truncate(detail_max_chars | int)) -%}
+          {%- endif -%}
+          {%- set _ = L.append('') -%}
+          {%- if failed | length > 0 -%}
+            {%- set _ = L.append('*⚠️ Findings disagree:*') -%}
+            {%- for c in failed -%}
+              {%- set _ = L.append('•  *' ~ (check_words[c.check] | default(c.check)) ~ '* (' ~ c.result ~ ') — '
+                    ~ c.detail | truncate(detail_max_chars | int)) -%}
+            {%- endfor -%}
+          {%- endif -%}
+          {%- if passed | length > 0 -%}
+            {%- set _ = L.append('*✅ Checks passed:* ' ~ (passed | map(attribute='check') | map('extract', check_words) | join(' · '))) -%}
+          {%- endif -%}
+          {%- set _ = L.append('') -%}
+          {%- if treatment_given -%}{%- set _ = L.append('*Proposed treatment:* ' ~ treatment_given) -%}{%- endif -%}
+          {%- set _ = L.append('*AI recommends:* ' ~ (treatment_words[ra.primary_treatment] | default(ra.primary_treatment))) -%}
+          {%- for t in ra.additional_treatments | default([]) -%}
+            {%- set key = t.split(':')[0] | trim -%}
+            {%- set text = t[(key | length) + 1:] | trim if (key in treatment_words and ':' in t) else t -%}
+            {%- set _ = L.append('      + ' ~ ((treatment_words[key] ~ ': ') if key in treatment_words else '') ~ text) -%}
+          {%- endfor -%}
+          {%- if ra.expert_questions | default([]) | length > 0 -%}
+            {%- set _ = L.append('') -%}
+            {%- set _ = L.append('*Please confirm before approving:*') -%}
+            {%- for q in ra.expert_questions -%}{%- set _ = L.append(loop.index ~ '. ' ~ q) -%}{%- endfor -%}
+          {%- endif -%}
+          {%- if ra_warnings | length > 0 -%}
+            {%- set _ = L.append('') -%}
+            {%- for w in ra_warnings -%}{%- set _ = L.append('_⚠️ Automation check: ' ~ w ~ '_') -%}{%- endfor -%}
+          {%- endif -%}
+          {%- set _ = L.append('') -%}
+          {%- set _ = L.append('✅ *Approve* = proceed with the fix   ·   ❌ *Deny* = no fix — reply in this thread with the reason') -%}
+          {%- set _ = L.append('') -%}
+          {%- set _ = L.append('🚨 *LIGHTWELL EXPERT ASSESSMENT REQUIRED*') -%}
+          {%- set _ = L.append('Approve / deny: ' ~ approval_url) -%}
+          {{ L | join(nl) }}
+
+    - name: Show the message (as it will be posted)
+      ansible.builtin.debug:
+        msg: "{{ [slack_title_out, '-' * 60] + slack_text_out.splitlines() }}"
+
+    - name: Show AI reasoning and message size
+      ansible.builtin.debug:
+        msg:
+          - "Likelihood reason: {{ ra.likelihood_reason | default('n/a') }}"
+          - "Impact reason    : {{ ra.impact_reason | default('n/a') }}"
+          - "Slack text length: {{ slack_text_out | length }} characters{{ '  <== over 3000, Slack may cut it' if slack_text_out | length > 3000 else '' }}"
+
+    - name: Show automation check warnings
+      ansible.builtin.debug:
+        msg: "{{ ra_warnings }}"
+      when: ra_warnings | length > 0
+
+    # ---------- 4. Publish and post ----------
+    - name: Publish assessment to downstream workflow nodes
+      ansible.builtin.set_stats:
+        data:
+          risk_assessment:
+            cve_id: "{{ ra.cve_id }}"
+            risk_rating: "{{ final_rating }}"
+            likelihood: "{{ ra.likelihood }}"
+            impact: "{{ ra.impact }}"
+            primary_treatment: "{{ ra.primary_treatment }}"
+            additional_treatments: "{{ ra.additional_treatments | default([]) }}"
+            failed_checks: "{{ ra_checks | rejectattr('result', 'eq', 'pass') | map(attribute='check') | list }}"
+            expert_questions: "{{ ra.expert_questions | default([]) }}"
+            warnings: "{{ ra_warnings }}"
+
+    - name: Post to Slack
+      ansible.builtin.include_tasks: tasks/slack_notify.yml
+      when: slack_enabled | bool
+      vars:
+        slack_title: "{{ slack_title_out }}"
+        slack_text: "{{ slack_text_out }}"
+        slack_new_thread: false
+        slack_broadcast: false
